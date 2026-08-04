@@ -1,0 +1,19 @@
+# miranda-yazio configuration.
+# All fields are optional — missing fields use built-in defaults from
+# internal/config.Default(). Secrets come from environment variables,
+# never from here (only the *name* of the env var is configured below).
+
+# http_addr: ":8790"
+# auth_token_env: "YAZIO_MCP_TOKEN"
+
+# yazio:
+#   username_env: "YAZIO_USERNAME"
+#   password_env: "YAZIO_PASSWORD"
+#   token_cache_path: ""          # "" = $XDG_CONFIG_HOME/yazio-mcp/token.json
+#   request_timeout_seconds: 15
+#   default_country: "BY"                          # ISO 3166-1 alpha-2, scopes product search
+#   default_locales: ["by_BY", "ru_RU", "en_EN"]    # priority-ordered fallback, scopes product search
+#   default_sex: "male"                             # male|female
+
+logging:
+  level: "info"

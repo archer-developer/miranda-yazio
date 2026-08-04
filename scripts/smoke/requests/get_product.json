@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_product","arguments":{"product_id":"9f87fa12-becf-11e6-a8ad-e0071b8a8723"}}}
