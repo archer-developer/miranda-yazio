@@ -144,6 +144,13 @@ func (a *authenticator) exchangeLocked(ctx context.Context, form url.Values) err
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
+	// Debug-level only, and with password/refresh_token redacted — unlike
+	// Client.send's request/response logging, this endpoint's request body
+	// carries the account password and its response body carries the
+	// access/refresh token, so these can never be logged verbatim (see the
+	// top-level Conventions on secrets).
+	a.logger.Debug("yazio: oauth request", "url", a.baseURL+"/oauth/token", "form", redactForm(form))
+
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("yazio: oauth token request: %w", err)
@@ -154,6 +161,8 @@ func (a *authenticator) exchangeLocked(ctx context.Context, form url.Values) err
 	if err != nil {
 		return fmt.Errorf("yazio: read oauth response: %w", err)
 	}
+
+	a.logger.Debug("yazio: oauth response", "status", resp.StatusCode, "body", redactTokenFields(body))
 
 	switch {
 	case resp.StatusCode == http.StatusOK:
@@ -193,4 +202,41 @@ func (a *authenticator) exchangeLocked(ctx context.Context, form url.Values) err
 	}
 
 	return nil
+}
+
+// redactForm renders form for logging with password/refresh_token values
+// replaced — grant_type/client_id/username are not secrets and are useful
+// for telling a login attempt apart from a refresh in the debug log.
+func redactForm(form url.Values) string {
+	redacted := url.Values{}
+	for k, v := range form {
+		if k == "password" || k == "refresh_token" {
+			redacted[k] = []string{"[REDACTED]"}
+			continue
+		}
+		redacted[k] = v
+	}
+	return redacted.Encode()
+}
+
+// redactTokenFields returns body with any "access_token"/"refresh_token"
+// JSON field values replaced, for safe debug logging of the oauth
+// endpoint's response. Falls back to a truncated raw string if body isn't
+// valid JSON (e.g. an HTML error page from an outage) — still safe, since
+// a non-JSON body can't carry a token value under either of those keys.
+func redactTokenFields(body []byte) string {
+	var generic map[string]any
+	if err := json.Unmarshal(body, &generic); err != nil {
+		return truncate(body, 300)
+	}
+	for _, key := range []string{"access_token", "refresh_token"} {
+		if _, ok := generic[key]; ok {
+			generic[key] = "[REDACTED]"
+		}
+	}
+	redacted, err := json.Marshal(generic)
+	if err != nil {
+		return truncate(body, 300)
+	}
+	return string(redacted)
 }

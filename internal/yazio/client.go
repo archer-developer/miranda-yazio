@@ -215,6 +215,14 @@ func (c *Client) send(ctx context.Context, method, path string, query url.Values
 		req.Header.Set("Content-Type", "application/json")
 	}
 
+	// Debug-level only (routed to logs/debug.log, not stdout/journal — see
+	// cmd/miranda-yazio/main.go's buildLogger). Safe to log verbatim: every
+	// request that reaches send() is a product/diary call, never the OAuth
+	// exchange (that's authenticator.exchangeLocked, which redacts
+	// separately), so neither the request body nor the response body here
+	// ever contains a credential or token.
+	c.logger.Debug("yazio: request", "method", method, "url", reqURL, "body", string(bodyBytes))
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("request failed: %w", err)
@@ -225,6 +233,8 @@ func (c *Client) send(ctx context.Context, method, path string, query url.Values
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("read response body: %w", err)
 	}
+
+	c.logger.Debug("yazio: response", "method", method, "url", reqURL, "status", resp.StatusCode, "body", string(respBody))
 
 	return respBody, resp.StatusCode, nil
 }
