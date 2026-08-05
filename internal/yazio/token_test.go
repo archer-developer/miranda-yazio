@@ -67,6 +67,18 @@ func TestDefaultTokenCachePath_FallsBackToDotConfig(t *testing.T) {
 	assert.Equal(t, filepath.Join(home, ".config", "yazio-mcp", "token.json"), path)
 }
 
+func TestTokenCachePathForUser_UsesDefaultDirWhenEmpty(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "/xdg-home")
+
+	path := TokenCachePathForUser("", "archer")
+	assert.Equal(t, filepath.Join("/xdg-home", "yazio-mcp", "token-archer.json"), path)
+}
+
+func TestTokenCachePathForUser_HonorsExplicitDir(t *testing.T) {
+	path := TokenCachePathForUser("/custom/dir", "archer")
+	assert.Equal(t, filepath.Join("/custom/dir", "token-archer.json"), path)
+}
+
 func TestToken_UsableRespectsRefreshBuffer(t *testing.T) {
 	tests := []struct {
 		name   string

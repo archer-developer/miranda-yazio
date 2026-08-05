@@ -25,6 +25,11 @@ Miranda <--Streamable HTTP (bearer token)--> httpserver
 
 ## MCP tools
 
+This service can hold multiple YAZIO accounts at once (one per household
+member, configured in `yazio.users` — see Configuration below), so every
+tool below takes a required `user` parameter selecting which account's
+diary to read or write.
+
 - **search_products** — find candidate foods by name/brand.
 - **get_product** — full detail for one product, including every serving
   type it supports (e.g. "piece", "portion", "glass") and its weight in
@@ -51,7 +56,7 @@ make build
 
 ```bash
 cp .env.example .env
-# fill in YAZIO_MCP_TOKEN (openssl rand -hex 32), YAZIO_USERNAME, YAZIO_PASSWORD
+# fill in YAZIO_MCP_TOKEN (openssl rand -hex 32), YAZIO_USERNAME_ARCHER, YAZIO_PASSWORD_ARCHER
 
 make run
 ```
@@ -63,11 +68,13 @@ and `/mcp` (the MCP endpoint, requires `Authorization: Bearer <token>`).
 curl -s http://localhost:8790/healthz
 ```
 
-On first request that needs YAZIO auth, the service logs in with
-`YAZIO_USERNAME`/`YAZIO_PASSWORD` and caches the resulting access/refresh
-token pair at `$XDG_CONFIG_HOME/yazio-mcp/token.json` (or
-`~/.config/yazio-mcp/token.json`), mode `0600`. Subsequent restarts reuse
-the cached token instead of logging in again.
+On first request that needs YAZIO auth for a given user, the service logs
+in with that user's configured username/password and caches the resulting
+access/refresh token pair at
+`$XDG_CONFIG_HOME/yazio-mcp/token-<name>.json` (or
+`~/.config/yazio-mcp/token-<name>.json`), mode `0600` — one file per
+configured user. Subsequent restarts reuse the cached tokens instead of
+logging in again.
 
 ## Testing and quality
 
@@ -89,18 +96,27 @@ MIRANDA_DEPLOY_HOST=user@host ./scripts/deploy.sh
 ```
 
 Cross-compiles for `linux/amd64`, ships the binary over SSH, and installs
-it as a `systemd --user` service. `config/config.yaml` and `.env` are
-**never uploaded** — create `.env` on the server by hand on first deploy
-with `YAZIO_MCP_TOKEN`, `YAZIO_USERNAME`, and `YAZIO_PASSWORD`.
+it as a `systemd --user` service. `config/*.yaml` and `.env` are **never
+uploaded** — create `.env` on the server by hand on first deploy with
+`YAZIO_MCP_TOKEN` and one `YAZIO_USERNAME_<NAME>`/`YAZIO_PASSWORD_<NAME>`
+pair per user configured in `config/*.yaml`'s `yazio.users` (e.g.
+`YAZIO_USERNAME_ARCHER`/`YAZIO_PASSWORD_ARCHER`).
 
 ## Configuration
 
-Every field has a built-in default (`internal/config.Default()`), so
-`config/config.yaml` only needs to override what differs. Secrets are
-never stored in `config.yaml` — only the *name* of the environment
-variable to read them from. See `config/config.yaml`'s comments for every
-available field (search locale/country, request timeout, token cache
-path, ...).
+Every field has a built-in default (`internal/config.Default()`); the
+service loads and merges **every** `config/*.yaml` file at startup (later
+file wins on any field both set — see `internal/config.Load`), so a
+deployment only needs to add a `config/*.yaml` file if something differs
+from the default. `config/config.yaml.dist` is checked into git as
+documentation and a copy-paste starting point — it is never read by the
+service (it doesn't end in `.yaml`). `config/*.yaml` itself is gitignored,
+since it typically holds real usernames and other environment-specific
+detail; secrets themselves are never stored in any `config/*.yaml` file,
+only the *name* of the environment variable to read them from. See
+`config/config.yaml.dist`'s comments for every available field (search
+locale/country, request timeout, token cache dir, ...). Override the
+config directory itself with `YAZIO_MCP_CONFIG_DIR` (default `config`).
 
 ## Project layout
 

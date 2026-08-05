@@ -1,1 +1,1 @@
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_consumed_items","arguments":{"date":"2024-01-15"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_consumed_items","arguments":{"user":"archer","date":"2024-01-15"}}}

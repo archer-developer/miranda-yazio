@@ -9,7 +9,7 @@ independent of any MCP client.
 
 ```bash
 # from the repo root
-cp .env.example .env   # fill in YAZIO_MCP_TOKEN, YAZIO_USERNAME, YAZIO_PASSWORD
+cp .env.example .env   # fill in YAZIO_MCP_TOKEN, YAZIO_USERNAME_ARCHER, YAZIO_PASSWORD_ARCHER
 make run                # or: ./miranda-yazio
 ```
 
@@ -30,7 +30,10 @@ make run                # or: ./miranda-yazio
   captured from a real working call. `product_id`/`item_id` values in
   these files are real IDs that existed in YAZIO's database at capture
   time (chicken soup, "Куриный суп") — re-run `search_products.json`
-  first if they've since changed or you want different products.
+  first if they've since changed or you want different products. Every
+  request's `arguments` hardcodes `"user":"archer"` — the account these
+  scripts are set up against (see Prerequisites); update it if your
+  `config.yaml` uses a different `yazio.users[].name`.
 
 - **`run-all.sh`** — the full sequence used to verify this service:
   `/healthz` → `tools/list` → `search_products` → `get_product` →

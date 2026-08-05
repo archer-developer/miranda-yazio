@@ -26,13 +26,14 @@ func (t Token) usable() bool {
 	return t.AccessToken != "" && time.Now().Before(t.ExpiresAt.Add(-tokenRefreshBuffer))
 }
 
-// DefaultTokenCachePath returns $XDG_CONFIG_HOME/yazio-mcp/token.json, or
-// ~/.config/yazio-mcp/token.json if XDG_CONFIG_HOME is unset. This follows
-// the XDG base directory spec explicitly rather than os.UserConfigDir()
-// (which returns a different, platform-specific path on macOS) since the
-// service is deployed to a Linux host under systemd --user regardless of
-// what platform it's developed on.
-func DefaultTokenCachePath() string {
+// defaultTokenCacheDir returns $XDG_CONFIG_HOME/yazio-mcp, or
+// ~/.config/yazio-mcp if XDG_CONFIG_HOME is unset. This follows the XDG
+// base directory spec explicitly rather than os.UserConfigDir() (which
+// returns a different, platform-specific path on macOS) since the service
+// is deployed to a Linux host under systemd --user regardless of what
+// platform it's developed on. Shared by DefaultTokenCachePath and
+// TokenCachePathForUser so there's one place that resolves this default.
+func defaultTokenCacheDir() string {
 	dir := os.Getenv("XDG_CONFIG_HOME")
 	if dir == "" {
 		home, err := os.UserHomeDir()
@@ -41,7 +42,27 @@ func DefaultTokenCachePath() string {
 		}
 		dir = filepath.Join(home, ".config")
 	}
-	return filepath.Join(dir, "yazio-mcp", "token.json")
+	return filepath.Join(dir, "yazio-mcp")
+}
+
+// DefaultTokenCachePath returns the legacy single-account token cache
+// file path (defaultTokenCacheDir()/token.json) — kept for callers that
+// pass Options.TokenCachePath directly (see yazio.Client.New) rather than
+// going through the per-user TokenCachePathForUser.
+func DefaultTokenCachePath() string {
+	return filepath.Join(defaultTokenCacheDir(), "token.json")
+}
+
+// TokenCachePathForUser returns the token cache file for one configured
+// YAZIO account under dir, or under defaultTokenCacheDir() if dir is
+// empty. Each account gets its own file — token pairs can't be shared
+// between accounts — named after the account's config key so a service
+// restart can find the right cache without any extra per-user config.
+func TokenCachePathForUser(dir, name string) string {
+	if dir == "" {
+		dir = defaultTokenCacheDir()
+	}
+	return filepath.Join(dir, "token-"+name+".json")
 }
 
 // TokenStore persists a Token to a single JSON file with 0600 permissions,

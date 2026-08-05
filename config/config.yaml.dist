@@ -1,0 +1,70 @@
+# miranda-yazio configuration template.
+#
+# Every field here has a built-in default (see internal/config/config.go) —
+# a deployment only needs a real config/*.yaml file at all if something
+# needs to differ from what's shown below. This file itself is never read
+# by the service (it doesn't end in .yaml); it exists purely as checked-in
+# documentation and a copy-paste starting point.
+#
+# To override something: copy the relevant block below into a new file
+# under config/, e.g. config/config.yaml or config/users.yaml — every
+# *.yaml file in config/ is loaded and merged (later file wins on any
+# field both set; see internal/config.Load), and config/*.yaml is
+# gitignored since it typically holds real usernames and other
+# environment-specific details. Secrets themselves never go in any
+# config/*.yaml file — only the *name* of the environment variable to read
+# them from (see the *_env fields below).
+
+# Address this service's Streamable HTTP MCP endpoint listens on.
+http_addr: ":8790"
+
+# Name of the environment variable holding the bearer token Miranda must
+# present on every MCP call (Authorization: Bearer <token>). Generate a
+# real value with: openssl rand -hex 32
+auth_token_env: "YAZIO_MCP_TOKEN"
+
+yazio:
+  # One entry per YAZIO account this service can act on behalf of — every
+  # MCP tool call names which one via its required "user" parameter,
+  # matched against "name" below. Add a household member by adding another
+  # entry here (with its own username_env/password_env — reusing another
+  # user's env var names is rejected at startup) — no code changes needed.
+  # "name" is used verbatim as a token-cache filename, so it's restricted
+  # to letters, digits, underscore, and hyphen.
+  users:
+    - name: "archer"
+      username_env: "YAZIO_USERNAME_ARCHER"
+      password_env: "YAZIO_PASSWORD_ARCHER"
+    # - name: "some_other_person"
+    #   username_env: "YAZIO_USERNAME_SOME_OTHER_PERSON"
+    #   password_env: "YAZIO_PASSWORD_SOME_OTHER_PERSON"
+
+  # Directory holding one cached access/refresh token file per user
+  # (token-<name>.json, mode 0600), created automatically on first
+  # successful login. "" computes the default at startup:
+  # $XDG_CONFIG_HOME/yazio-mcp/, falling back to ~/.config/yazio-mcp/.
+  token_cache_dir: ""
+
+  # Bounds every individual HTTP call made to YAZIO — the unofficial API
+  # can hang or go dark without warning.
+  request_timeout_seconds: 15
+
+  # Sent on every search_products call, shared by every configured user
+  # above (not a per-user setting — see CLAUDE.md's "What's deliberately
+  # not here"). YAZIO's product database is region-scoped, so searching a
+  # local brand name without the matching country/locale often returns no
+  # results. default_locales is a priority-ordered fallback list
+  # (most-preferred first).
+  default_country: "BY" # ISO 3166-1 alpha-2
+  default_locales: ["by_BY", "ru_RU", "en_EN"]
+
+  # Sent on every search_products call, mirroring what the YAZIO mobile
+  # app sends for the logged-in account. male|female
+  default_sex: "male"
+
+logging:
+  # One of "debug", "info", "warn", "error". At "debug", verbose
+  # per-request logs (including full YAZIO request/response bodies) are
+  # routed to logs/debug.log instead of stdout, to avoid flooding the
+  # systemd journal.
+  level: "info"

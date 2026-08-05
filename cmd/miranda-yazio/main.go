@@ -1,14 +1,16 @@
 // Command miranda-yazio is an MCP server that lets Miranda read and write
-// a YAZIO food diary on behalf of one account. YAZIO has no official
-// public API — internal/yazio talks to the same unofficial v15 REST API
-// the YAZIO mobile app uses.
+// YAZIO food diaries on behalf of a small, config-defined set of accounts
+// (one per household member). YAZIO has no official public API —
+// internal/yazio talks to the same unofficial v15 REST API the YAZIO
+// mobile app uses.
 //
-// Bootstrap: envfile.Load(.env) -> config.Load(config/config.yaml) -> build
-// the real logger -> check required secrets are set (this service's own
-// MCP bearer token, plus the YAZIO account's username/password) -> build
-// the yazio.Client -> build the MCP server -> wrap it in a Streamable HTTP
-// handler -> mount it behind bearer auth and /healthz -> serve until
-// SIGINT/SIGTERM, then shut down gracefully.
+// Bootstrap: envfile.Load(.env) -> glob config/*.yaml and config.Load them
+// all -> build the real logger -> check required secrets are set (this
+// service's own MCP bearer token, plus each configured user's YAZIO
+// username/password) -> build one yazio.Client per user -> build the MCP
+// server -> wrap it in a Streamable HTTP handler -> mount it behind bearer
+// auth and /healthz -> serve until SIGINT/SIGTERM, then shut down
+// gracefully.
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
 	"time"
 
@@ -33,12 +36,12 @@ import (
 )
 
 const (
-	dotEnvPath        = ".env"
-	defaultConfigPath = "config/config.yaml"
-	configPathEnv     = "YAZIO_MCP_CONFIG"
-	shutdownTimeout   = 10 * time.Second
-	debugLogDir       = "logs"
-	debugLogFile      = "debug.log"
+	dotEnvPath       = ".env"
+	defaultConfigDir = "config"
+	configDirEnv     = "YAZIO_MCP_CONFIG_DIR"
+	shutdownTimeout  = 10 * time.Second
+	debugLogDir      = "logs"
+	debugLogFile     = "debug.log"
 )
 
 func main() {
@@ -48,12 +51,21 @@ func main() {
 		logger.Warn("failed to load .env, continuing with process environment", "error", err)
 	}
 
-	cfgPath := defaultConfigPath
-	if v := os.Getenv(configPathEnv); v != "" {
-		cfgPath = v
+	configDir := defaultConfigDir
+	if v := os.Getenv(configDirEnv); v != "" {
+		configDir = v
+	}
+	// config.yaml.dist (checked into git, never read here) documents every
+	// field; *.yaml files in configDir are gitignored per-deployment
+	// overrides, merged in glob order (lexicographic) — see
+	// internal/config.Load's doc comment for the merge semantics.
+	configPaths, err := filepath.Glob(filepath.Join(configDir, "*.yaml"))
+	if err != nil {
+		logger.Error("fatal", "error", err)
+		os.Exit(1)
 	}
 
-	cfg, err := config.Load(cfgPath)
+	cfg, err := config.Load(configPaths...)
 	if err != nil {
 		logger.Error("fatal", "error", err)
 		os.Exit(1)
@@ -79,38 +91,50 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("main: environment variable %s (named by auth_token_env) is not set — refusing to start with no auth token", cfg.AuthTokenEnv)
 	}
 
-	username := os.Getenv(cfg.Yazio.UsernameEnv)
-	if username == "" {
-		return fmt.Errorf("main: environment variable %s (named by yazio.username_env) is not set — YAZIO account username required", cfg.Yazio.UsernameEnv)
-	}
-	password := os.Getenv(cfg.Yazio.PasswordEnv)
-	if password == "" {
-		return fmt.Errorf("main: environment variable %s (named by yazio.password_env) is not set — YAZIO account password required", cfg.Yazio.PasswordEnv)
-	}
+	clients := make(map[string]mcpserver.YazioClient, len(cfg.Yazio.Users))
+	for _, u := range cfg.Yazio.Users {
+		username := os.Getenv(u.UsernameEnv)
+		if username == "" {
+			return fmt.Errorf("main: environment variable %s (yazio.users[%q].username_env) is not set — YAZIO account username required", u.UsernameEnv, u.Name)
+		}
+		password := os.Getenv(u.PasswordEnv)
+		if password == "" {
+			return fmt.Errorf("main: environment variable %s (yazio.users[%q].password_env) is not set — YAZIO account password required", u.PasswordEnv, u.Name)
+		}
 
-	yazioClient, err := yazio.New(yazio.Options{
-		Username:       username,
-		Password:       password,
-		TokenCachePath: cfg.Yazio.TokenCachePath,
-		RequestTimeout: time.Duration(cfg.Yazio.RequestTimeoutSeconds) * time.Second,
-		DefaultCountry: cfg.Yazio.DefaultCountry,
-		DefaultLocales: cfg.Yazio.DefaultLocales,
-		DefaultSex:     cfg.Yazio.DefaultSex,
-		Logger:         logger,
-	})
-	if err != nil {
-		return fmt.Errorf("main: build yazio client: %w", err)
+		client, err := yazio.New(yazio.Options{
+			Username:       username,
+			Password:       password,
+			TokenCachePath: yazio.TokenCachePathForUser(cfg.Yazio.TokenCacheDir, u.Name),
+			RequestTimeout: time.Duration(cfg.Yazio.RequestTimeoutSeconds) * time.Second,
+			DefaultCountry: cfg.Yazio.DefaultCountry,
+			DefaultLocales: cfg.Yazio.DefaultLocales,
+			DefaultSex:     cfg.Yazio.DefaultSex,
+			Logger:         logger.With("yazio_user", u.Name),
+		})
+		if err != nil {
+			return fmt.Errorf("main: build yazio client for user %q: %w", u.Name, err)
+		}
+		clients[u.Name] = client
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	server := mcpserver.New(yazioClient, logger)
+	server := mcpserver.New(clients, logger)
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
 	handler := httpserver.New(mcpHandler, token)
 	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: handler}
 
-	logger.Info("service ready", "addr", cfg.HTTPAddr, "yazio_username_env", cfg.Yazio.UsernameEnv)
+	// Derived fresh from clients (the map that's actually served) rather
+	// than tracked in lockstep during the build loop above, so this log
+	// line can't drift from what mcpserver.New was actually handed.
+	userNames := make([]string, 0, len(clients))
+	for name := range clients {
+		userNames = append(userNames, name)
+	}
+	sort.Strings(userNames)
+	logger.Info("service ready", "addr", cfg.HTTPAddr, "yazio_users", userNames)
 
 	return serveUntilInterrupted(ctx, httpServer, logger)
 }

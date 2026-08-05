@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the service for linux/amd64 and ships the binary plus a systemd
-# --user unit to the target host. config/config.yaml and .env are never
+# --user unit to the target host. config/*.yaml and .env are never
 # touched by this script — they hold host-specific secrets (including the
 # YAZIO account password) and are managed separately on the server.
 #
@@ -13,7 +13,7 @@ remote_host="${MIRANDA_DEPLOY_HOST:?set MIRANDA_DEPLOY_HOST, e.g. user@host}"
 remote_dir="miranda-yazio"
 service_name="miranda-yazio"
 binary_name="miranda-yazio"    # keep in sync with Makefile's BINARY
-healthz_port="8790"            # keep in sync with config/config.yaml's http_addr
+healthz_port="8790"            # keep in sync with config/config.yaml.dist's http_addr
 build_out="dist/${binary_name}-linux-amd64"
 unit_file="$(mktemp)"
 trap 'rm -f "$unit_file"' EXIT

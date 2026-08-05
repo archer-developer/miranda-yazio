@@ -4,12 +4,12 @@
 #   add_consumed_item -> get_consumed_items (confirms it landed) ->
 #   remove_consumed_item -> get_consumed_items (confirms cleanup)
 #
-# This performs one real write-then-delete against the configured YAZIO
+# This performs one real write-then-delete against the "archer" YAZIO
 # account's diary (a "snack" entry for whatever search_products finds
 # first) — it cleans up after itself, but it is not a dry run.
 #
 # Requires the service to be running with a valid .env:
-#   cp .env.example .env   # fill in YAZIO_MCP_TOKEN/YAZIO_USERNAME/YAZIO_PASSWORD
+#   cp .env.example .env   # fill in YAZIO_MCP_TOKEN/YAZIO_USERNAME_ARCHER/YAZIO_PASSWORD_ARCHER
 #   make run
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -62,13 +62,13 @@ product_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["structure
 [ -n "$product_id" ] && pass "found product $product_id" || fail "search_products returned no results"
 
 echo "==> get_product $product_id"
-get_product_req="$(python3 -c "import json; print(json.dumps({'jsonrpc':'2.0','id':4,'method':'tools/call','params':{'name':'get_product','arguments':{'product_id':'$product_id'}}}))")"
+get_product_req="$(python3 -c "import json; print(json.dumps({'jsonrpc':'2.0','id':4,'method':'tools/call','params':{'name':'get_product','arguments':{'user':'archer','product_id':'$product_id'}}}))")"
 product_result="$(echo "$get_product_req" | "$smoke_dir/mcp-call.sh" | extract_result)"
 default_amount="$(python3 -c 'import json,sys; p=json.load(sys.stdin)["structuredContent"]["product"]; s=p.get("servings") or []; print(s[0]["amount_grams"] if s else 100)' <<<"$product_result")"
 pass "product detail fetched, will log amount_grams=$default_amount"
 
 echo "==> add_consumed_item"
-add_req="$(python3 -c "import json; print(json.dumps({'jsonrpc':'2.0','id':6,'method':'tools/call','params':{'name':'add_consumed_item','arguments':{'product_id':'$product_id','amount_grams':$default_amount,'meal_type':'snack'}}}))")"
+add_req="$(python3 -c "import json; print(json.dumps({'jsonrpc':'2.0','id':6,'method':'tools/call','params':{'name':'add_consumed_item','arguments':{'user':'archer','product_id':'$product_id','amount_grams':$default_amount,'meal_type':'snack'}}}))")"
 add_result="$(echo "$add_req" | "$smoke_dir/mcp-call.sh" | extract_result)"
 logged="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["structuredContent"]["logged"])' <<<"$add_result")"
 [ "$logged" = "True" ] && pass "logged test entry" || fail "add_consumed_item did not report logged=true"
@@ -84,7 +84,7 @@ print(matches[-1]['id'] if matches else '')
 [ -n "$item_id" ] && pass "confirmed entry $item_id in today's diary" || fail "test entry not found in get_consumed_items"
 
 echo "==> remove_consumed_item $item_id (cleanup)"
-remove_req="$(python3 -c "import json; print(json.dumps({'jsonrpc':'2.0','id':7,'method':'tools/call','params':{'name':'remove_consumed_item','arguments':{'item_id':'$item_id'}}}))")"
+remove_req="$(python3 -c "import json; print(json.dumps({'jsonrpc':'2.0','id':7,'method':'tools/call','params':{'name':'remove_consumed_item','arguments':{'user':'archer','item_id':'$item_id'}}}))")"
 remove_result="$(echo "$remove_req" | "$smoke_dir/mcp-call.sh" | extract_result)"
 removed="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["structuredContent"]["removed"])' <<<"$remove_result")"
 [ "$removed" = "True" ] && pass "removed test entry" || fail "remove_consumed_item did not report removed=true"

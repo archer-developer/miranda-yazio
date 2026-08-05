@@ -1,1 +1,1 @@
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"add_consumed_item","arguments":{"product_id":"9f87fa12-becf-11e6-a8ad-e0071b8a8723","amount_grams":245,"meal_type":"snack"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"add_consumed_item","arguments":{"user":"archer","product_id":"9f87fa12-becf-11e6-a8ad-e0071b8a8723","amount_grams":245,"meal_type":"snack"}}}
