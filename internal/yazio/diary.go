@@ -19,29 +19,33 @@ const (
 	dateTimeLayout = "2006-01-02 15:04:05"
 )
 
-// GetConsumedItems returns the diary entries logged for the given date
-// (only the day portion of date is used).
-func (c *Client) GetConsumedItems(ctx context.Context, date time.Time) ([]ConsumedItem, error) {
+// GetConsumedItems returns the product entries and recipe portions logged
+// for the given date (only the day portion of date is used).
+//
+// The two slices correspond to YAZIO's "products" and "recipe_portions"
+// response fields. Product entries are removed with RemoveConsumedItem;
+// recipe portions require RemoveConsumedRecipePortion because the delete
+// body shape differs.
+func (c *Client) GetConsumedItems(ctx context.Context, date time.Time) ([]ConsumedItem, []ConsumedRecipePortion, error) {
 	q := url.Values{"date": {date.Format(dateLayout)}}
 
 	body, err := c.do(ctx, http.MethodGet, "/user/consumed-items", q, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Despite yazio_public_api's swagger doc describing this response as a
-	// bare array, the live API returns an object with "products" (plus
-	// "recipe_portions"/"simple_products", which this client doesn't
-	// support logging — see AddConsumedItem). Confirmed against the real
+	// bare array, the live API returns an object with "products",
+	// "recipe_portions", and "simple_products". Confirmed against the real
 	// API rather than trusted from the doc, since it's unofficial.
 	var resp struct {
-		Products []ConsumedItem `json:"products"`
+		Products       []ConsumedItem          `json:"products"`
+		RecipePortions []ConsumedRecipePortion `json:"recipe_portions"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("yazio: GetConsumedItems: decode response (API may have changed shape): %w", err)
+		return nil, nil, fmt.Errorf("yazio: GetConsumedItems: decode response (API may have changed shape): %w", err)
 	}
-	items := resp.Products
-	return items, nil
+	return resp.Products, resp.RecipePortions, nil
 }
 
 // AddConsumedItem logs amount grams (or milliliters, for a liquid
@@ -93,8 +97,11 @@ func (c *Client) AddConsumedItem(ctx context.Context, productID string, amount f
 	return err
 }
 
-// RemoveConsumedItem deletes one diary entry by its item ID (the ID
-// returned in ConsumedItem, not a product ID).
+// RemoveConsumedItem deletes one product diary entry by its item ID (the
+// ID returned in ConsumedItem, not a product ID).
+//
+// For recipe-portion entries use RemoveConsumedRecipePortion — the delete
+// body shape is different and a bare array is only accepted for products.
 func (c *Client) RemoveConsumedItem(ctx context.Context, itemID string) error {
 	itemID = strings.TrimSpace(itemID)
 	if itemID == "" {
@@ -102,6 +109,63 @@ func (c *Client) RemoveConsumedItem(ctx context.Context, itemID string) error {
 	}
 
 	_, err := c.do(ctx, http.MethodDelete, "/user/consumed-items", nil, []string{itemID})
+	return err
+}
+
+// AddConsumedRecipePortion logs portions of a saved recipe to the diary for
+// mealType ("breakfast"/"lunch"/"dinner"/"snack") on date. portions may be
+// fractional (e.g. 0.5 for half a portion, 2 for a double helping).
+func (c *Client) AddConsumedRecipePortion(ctx context.Context, recipeID string, portions float64, mealType string, date time.Time) error {
+	recipeID = strings.TrimSpace(recipeID)
+	if recipeID == "" {
+		return fmt.Errorf("yazio: AddConsumedRecipePortion: recipeID must not be empty")
+	}
+	if portions <= 0 {
+		return fmt.Errorf("yazio: AddConsumedRecipePortion: portions must be positive, got %v", portions)
+	}
+	daytime, err := normalizeMealType(mealType)
+	if err != nil {
+		return err
+	}
+
+	entryID, err := newItemID()
+	if err != nil {
+		return fmt.Errorf("yazio: AddConsumedRecipePortion: %w", err)
+	}
+
+	reqBody := map[string]any{
+		"products": []any{},
+		"recipe_portions": []map[string]any{
+			{
+				"id":           entryID,
+				"recipe_id":    recipeID,
+				"portion_count": portions,
+				"daytime":      daytime,
+				"date":         date.Format(dateTimeLayout),
+			},
+		},
+		"simple_products": []any{},
+	}
+
+	_, err = c.do(ctx, http.MethodPost, "/user/consumed-items", nil, reqBody)
+	return err
+}
+
+// RemoveConsumedRecipePortion deletes one recipe-portion diary entry by its
+// entry ID (the ID returned in ConsumedRecipePortion, not the recipe ID).
+//
+// The delete body for recipe portions uses {"recipe_portions": "<id>"}, not
+// the bare array that RemoveConsumedItem sends — these are different YAZIO
+// API shapes for the same DELETE endpoint.
+func (c *Client) RemoveConsumedRecipePortion(ctx context.Context, entryID string) error {
+	entryID = strings.TrimSpace(entryID)
+	if entryID == "" {
+		return fmt.Errorf("yazio: RemoveConsumedRecipePortion: entryID must not be empty")
+	}
+
+	_, err := c.do(ctx, http.MethodDelete, "/user/consumed-items", nil, map[string]string{
+		"recipe_portions": entryID,
+	})
 	return err
 }
 

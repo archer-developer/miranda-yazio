@@ -1,18 +1,21 @@
 // Package mcpserver registers this service's MCP tools and wires them to
 // internal/yazio, the YAZIO API client.
 //
-// The five tools mirror a natural conversation flow: search_products finds
-// candidate foods, get_product exposes the serving types a chosen food
-// supports (so a caller can convert "2 pieces" or "a cup" into grams
-// without the end user ever typing a gram figure), add_consumed_item logs
-// the computed gram amount to the diary, get_consumed_items reads today's
-// (or any day's) log back, and remove_consumed_item corrects a mistake.
+// Tools are grouped into two flows:
 //
-// This service is not single-tenant: it can hold a live YazioClient for
-// several YAZIO accounts at once (one per configured household member),
-// so every tool takes a required "user" parameter selecting which
-// account's diary to read or write. New takes a map keyed by that user
-// name rather than a single client — see resolveClient.
+//   - Product diary flow (5 tools): search_products → get_product →
+//     add_consumed_item; get_consumed_items reads back; remove_consumed_item
+//     corrects a mistake.
+//
+//   - Recipe flow (6 tools): create_recipe builds a saved multi-ingredient
+//     dish; list_recipes / get_recipe browse what exists; add_consumed_recipe
+//     logs portions of a recipe to the diary; remove_consumed_recipe corrects
+//     a mistake; delete_recipe removes the recipe itself.
+//
+// This service is not single-tenant: it holds a live YazioClient for each
+// configured household member, and every tool takes a required "user"
+// parameter selecting which account's diary to read or write. New takes a
+// map keyed by that user name rather than a single client — see resolveClient.
 package mcpserver
 
 import (
@@ -44,11 +47,20 @@ const (
 // everywhere) lets tests substitute a fake without hitting the real
 // YAZIO API — the same pattern miranda-diary uses for its Embedder.
 type YazioClient interface {
+	// Product search and diary (product entries).
 	SearchProducts(ctx context.Context, query string) ([]yazio.Product, error)
 	GetProduct(ctx context.Context, id string) (*yazio.Product, error)
-	GetConsumedItems(ctx context.Context, date time.Time) ([]yazio.ConsumedItem, error)
+	GetConsumedItems(ctx context.Context, date time.Time) ([]yazio.ConsumedItem, []yazio.ConsumedRecipePortion, error)
 	AddConsumedItem(ctx context.Context, productID string, amount float64, mealType string, date time.Time) error
 	RemoveConsumedItem(ctx context.Context, itemID string) error
+
+	// Recipes.
+	ListRecipes(ctx context.Context) ([]string, error)
+	GetRecipe(ctx context.Context, id string) (*yazio.Recipe, error)
+	CreateRecipe(ctx context.Context, name string, portionCount int, ingredients []yazio.RecipeIngredient, totalNutrients yazio.Nutrients, instructions []string) (string, error)
+	DeleteRecipe(ctx context.Context, id string) error
+	AddConsumedRecipePortion(ctx context.Context, recipeID string, portions float64, mealType string, date time.Time) error
+	RemoveConsumedRecipePortion(ctx context.Context, entryID string) error
 }
 
 // New builds and returns the MCP server with all five YAZIO tools
@@ -110,10 +122,60 @@ func New(clients map[string]YazioClient, logger *slog.Logger) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "remove_consumed_item",
-		Description: "Delete one diary entry by its item ID, as returned by get_consumed_items. " +
-			"Use this to correct a mistaken add_consumed_item call." +
+		Description: "Delete one product diary entry by its item ID, as returned by get_consumed_items's items list. " +
+			"Use this to correct a mistaken add_consumed_item call. " +
+			"For recipe portions use remove_consumed_recipe instead." +
 			userHint,
 	}, removeConsumedItemHandler(clients, users, logger))
+
+	// --- recipe tools ---
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "list_recipes",
+		Description: "List all recipes this user has created in YAZIO, with their IDs and per-portion nutrition. " +
+			"Use the recipe_id from this list to log a recipe with add_consumed_recipe or to inspect it with get_recipe." +
+			userHint,
+	}, listRecipesHandler(clients, users, logger))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "get_recipe",
+		Description: "Get full detail for one recipe by recipe_id: ingredient list, portion count, instructions, and total nutrition. " +
+			"Useful to confirm which recipe to log before calling add_consumed_recipe." +
+			userHint,
+	}, getRecipeHandler(clients, users, logger))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "create_recipe",
+		Description: "Create a new recipe from a list of YAZIO products. " +
+			"Each ingredient needs a product_id (from search_products) and an amount_grams. " +
+			"At least two ingredients are required — YAZIO rejects single-ingredient recipes. " +
+			"Nutrients are computed automatically from the ingredient amounts. " +
+			"The returned recipe_id can be passed to add_consumed_recipe to log the recipe to the diary." +
+			userHint,
+	}, createRecipeHandler(clients, users, logger))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "delete_recipe",
+		Description: "Delete one of the user's own recipes. " +
+			"Diary entries that already logged portions of this recipe are not affected — " +
+			"use remove_consumed_recipe to remove those." +
+			userHint,
+	}, deleteRecipeHandler(clients, users, logger))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "add_consumed_recipe",
+		Description: "Log one or more portions of a saved recipe to the diary for a given meal and date (defaults to today). " +
+			"Use list_recipes to find the recipe_id. " +
+			"portions may be fractional (e.g. 0.5 for half a portion, 2 for a double helping)." +
+			userHint,
+	}, addConsumedRecipeHandler(clients, users, logger))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "remove_consumed_recipe",
+		Description: "Delete one recipe-portion diary entry by its entry_id, as returned by get_consumed_items's recipe_portions list. " +
+			"Use this to correct a mistaken add_consumed_recipe call." +
+			userHint,
+	}, removeConsumedRecipeHandler(clients, users, logger))
 
 	return server
 }
@@ -369,10 +431,21 @@ type ConsumedItemInfo struct {
 	ServingQuantity float64 `json:"serving_quantity,omitempty"`
 }
 
+// ConsumedRecipePortionInfo is the MCP-facing shape of a logged recipe
+// portion returned by get_consumed_items. Use its entry_id (not recipe_id)
+// with remove_consumed_recipe to delete it.
+type ConsumedRecipePortionInfo struct {
+	EntryID      string  `json:"entry_id"`
+	RecipeID     string  `json:"recipe_id"`
+	Daytime      string  `json:"daytime"`
+	PortionCount float64 `json:"portion_count"`
+}
+
 type GetConsumedItemsOutput struct {
-	Date  string             `json:"date"`
-	Items []ConsumedItemInfo `json:"items"`
-	Total int                `json:"total"`
+	Date           string                      `json:"date"`
+	Items          []ConsumedItemInfo          `json:"items"`
+	RecipePortions []ConsumedRecipePortionInfo `json:"recipe_portions"`
+	Total          int                         `json:"total"`
 }
 
 func getConsumedItemsHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[GetConsumedItemsInput, GetConsumedItemsOutput] {
@@ -387,13 +460,13 @@ func getConsumedItemsHandler(clients map[string]YazioClient, users []string, log
 			return nil, GetConsumedItemsOutput{}, fmt.Errorf("get_consumed_items: %w", err)
 		}
 
-		items, err := client.GetConsumedItems(ctx, date)
+		products, portions, err := client.GetConsumedItems(ctx, date)
 		if err != nil {
 			return nil, GetConsumedItemsOutput{}, friendlyYazioError("get_consumed_items", in.User, err)
 		}
 
-		infos := make([]ConsumedItemInfo, len(items))
-		for i, it := range items {
+		infos := make([]ConsumedItemInfo, len(products))
+		for i, it := range products {
 			infos[i] = ConsumedItemInfo{
 				ID:              it.ID,
 				ProductID:       it.ProductID,
@@ -404,26 +477,40 @@ func getConsumedItemsHandler(clients map[string]YazioClient, users []string, log
 			}
 		}
 
-		dateStr := date.Format(dateLayout)
-		logger.Info("get_consumed_items", "user", in.User, "date", dateStr, "found", len(infos))
+		portionInfos := make([]ConsumedRecipePortionInfo, len(portions))
+		for i, p := range portions {
+			portionInfos[i] = ConsumedRecipePortionInfo{
+				EntryID:      p.ID,
+				RecipeID:     p.RecipeID,
+				Daytime:      p.Daytime,
+				PortionCount: p.PortionCount,
+			}
+		}
 
-		out := GetConsumedItemsOutput{Date: dateStr, Items: infos, Total: len(infos)}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: formatConsumedItems(dateStr, infos)}}}, out, nil
+		dateStr := date.Format(dateLayout)
+		total := len(infos) + len(portionInfos)
+		logger.Info("get_consumed_items", "user", in.User, "date", dateStr, "products", len(infos), "recipe_portions", len(portionInfos))
+
+		out := GetConsumedItemsOutput{Date: dateStr, Items: infos, RecipePortions: portionInfos, Total: total}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: formatConsumedItems(dateStr, infos, portionInfos)}}}, out, nil
 	}
 }
 
-func formatConsumedItems(date string, items []ConsumedItemInfo) string {
-	if len(items) == 0 {
+func formatConsumedItems(date string, items []ConsumedItemInfo, portions []ConsumedRecipePortionInfo) string {
+	if len(items) == 0 && len(portions) == 0 {
 		return fmt.Sprintf("No diary entries for %s.", date)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d entr(y/ies) for %s:\n", len(items), date)
+	fmt.Fprintf(&b, "%d entr(y/ies) for %s:\n", len(items)+len(portions), date)
 	for _, it := range items {
 		fmt.Fprintf(&b, "\n- id: %s\n  product_id: %s\n  meal: %s\n  amount: %gg", it.ID, it.ProductID, it.Daytime, it.AmountGrams)
 		if it.Serving != "" {
 			fmt.Fprintf(&b, " (%g x %q)", it.ServingQuantity, it.Serving)
 		}
 		b.WriteString("\n")
+	}
+	for _, p := range portions {
+		fmt.Fprintf(&b, "\n- entry_id: %s  [recipe]\n  recipe_id: %s\n  meal: %s\n  portions: %g\n", p.EntryID, p.RecipeID, p.Daytime, p.PortionCount)
 	}
 	return b.String()
 }
@@ -511,6 +598,397 @@ func removeConsumedItemHandler(clients map[string]YazioClient, users []string, l
 
 		out := RemoveConsumedItemOutput{Removed: true, ItemID: in.ItemID}
 		text := fmt.Sprintf("Deleted diary entry %s.", in.ItemID)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+	}
+}
+
+// --- list_recipes ---
+
+type ListRecipesInput struct {
+	User string `json:"user" jsonschema:"Which configured YAZIO account's recipes to list."`
+}
+
+type RecipeSummary struct {
+	RecipeID     string  `json:"recipe_id"`
+	Name         string  `json:"name"`
+	PortionCount float64 `json:"portion_count"`
+	EnergyKcal   float64 `json:"energy_kcal_per_portion"`
+	ProteinG     float64 `json:"protein_g_per_portion"`
+	FatG         float64 `json:"fat_g_per_portion"`
+	CarbG        float64 `json:"carb_g_per_portion"`
+}
+
+type ListRecipesOutput struct {
+	Recipes []RecipeSummary `json:"recipes"`
+	Total   int             `json:"total"`
+}
+
+func listRecipesHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[ListRecipesInput, ListRecipesOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in ListRecipesInput) (*mcp.CallToolResult, ListRecipesOutput, error) {
+		client, err := resolveClient(clients, users, "list_recipes", in.User)
+		if err != nil {
+			return nil, ListRecipesOutput{}, err
+		}
+
+		ids, err := client.ListRecipes(ctx)
+		if err != nil {
+			return nil, ListRecipesOutput{}, friendlyYazioError("list_recipes", in.User, err)
+		}
+
+		summaries := make([]RecipeSummary, 0, len(ids))
+		for _, id := range ids {
+			r, err := client.GetRecipe(ctx, id)
+			if err != nil {
+				// A recipe that 404s between list and fetch is not fatal —
+				// skip it rather than aborting the whole listing.
+				if errors.Is(err, yazio.ErrNotFound) {
+					logger.Warn("list_recipes: recipe disappeared between list and fetch", "user", in.User, "recipe_id", id)
+					continue
+				}
+				return nil, ListRecipesOutput{}, friendlyYazioError("list_recipes", in.User, err)
+			}
+			portions := max(r.PortionCount, 1)
+			summaries = append(summaries, RecipeSummary{
+				RecipeID:     r.ID,
+				Name:         r.Name,
+				PortionCount: r.PortionCount,
+				EnergyKcal:   r.Nutrients.EnergyKcalPerGram() / portions,
+				ProteinG:     r.Nutrients.ProteinPerGram() / portions,
+				FatG:         r.Nutrients.FatPerGram() / portions,
+				CarbG:        r.Nutrients.CarbPerGram() / portions,
+			})
+		}
+
+		logger.Info("list_recipes", "user", in.User, "found", len(summaries))
+
+		out := ListRecipesOutput{Recipes: summaries, Total: len(summaries)}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: formatRecipeList(summaries)}}}, out, nil
+	}
+}
+
+func formatRecipeList(recipes []RecipeSummary) string {
+	if len(recipes) == 0 {
+		return "No recipes found."
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Found %d recipe(s):\n", len(recipes))
+	for i, r := range recipes {
+		fmt.Fprintf(&b, "\n--- #%d: %s ---\n", i+1, r.Name)
+		fmt.Fprintf(&b, "recipe_id: %s\n", r.RecipeID)
+		fmt.Fprintf(&b, "portions: %g  |  per portion: %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb\n",
+			r.PortionCount, r.EnergyKcal, r.ProteinG, r.FatG, r.CarbG)
+	}
+	return b.String()
+}
+
+// --- get_recipe ---
+
+type GetRecipeInput struct {
+	User     string `json:"user" jsonschema:"Which configured YAZIO account to look up the recipe for."`
+	RecipeID string `json:"recipe_id" jsonschema:"The recipe UUID, from list_recipes."`
+}
+
+type RecipeDetail struct {
+	RecipeID        string          `json:"recipe_id"`
+	Name            string          `json:"name"`
+	PortionCount    float64         `json:"portion_count"`
+	EnergyKcal      float64         `json:"energy_kcal_total"`
+	ProteinG        float64         `json:"protein_g_total"`
+	FatG            float64         `json:"fat_g_total"`
+	CarbG           float64         `json:"carb_g_total"`
+	Ingredients     []IngredientInfo `json:"ingredients"`
+	Instructions    []string        `json:"instructions,omitempty"`
+}
+
+type IngredientInfo struct {
+	ProductID   string  `json:"product_id"`
+	Name        string  `json:"name"`
+	Producer    string  `json:"producer,omitempty"`
+	AmountGrams float64 `json:"amount_grams"`
+}
+
+type GetRecipeOutput struct {
+	Recipe RecipeDetail `json:"recipe"`
+}
+
+func getRecipeHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[GetRecipeInput, GetRecipeOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in GetRecipeInput) (*mcp.CallToolResult, GetRecipeOutput, error) {
+		client, err := resolveClient(clients, users, "get_recipe", in.User)
+		if err != nil {
+			return nil, GetRecipeOutput{}, err
+		}
+		if strings.TrimSpace(in.RecipeID) == "" {
+			return nil, GetRecipeOutput{}, fmt.Errorf("get_recipe: recipe_id must not be empty")
+		}
+
+		r, err := client.GetRecipe(ctx, in.RecipeID)
+		if err != nil {
+			return nil, GetRecipeOutput{}, friendlyYazioError("get_recipe", in.User, err)
+		}
+
+		ings := make([]IngredientInfo, len(r.Servings))
+		for i, s := range r.Servings {
+			ings[i] = IngredientInfo{ProductID: s.ProductID, Name: s.Name, Producer: s.Producer, AmountGrams: s.Amount}
+		}
+
+		detail := RecipeDetail{
+			RecipeID:     r.ID,
+			Name:         r.Name,
+			PortionCount: r.PortionCount,
+			EnergyKcal:   r.Nutrients.EnergyKcalPerGram(),
+			ProteinG:     r.Nutrients.ProteinPerGram(),
+			FatG:         r.Nutrients.FatPerGram(),
+			CarbG:        r.Nutrients.CarbPerGram(),
+			Ingredients:  ings,
+			Instructions: r.Instructions,
+		}
+
+		logger.Info("get_recipe", "user", in.User, "recipe_id", in.RecipeID, "ingredients", len(ings))
+
+		out := GetRecipeOutput{Recipe: detail}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: formatRecipeDetail(detail)}}}, out, nil
+	}
+}
+
+func formatRecipeDetail(r RecipeDetail) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s (recipe_id: %s)\n", r.Name, r.RecipeID)
+	fmt.Fprintf(&b, "portions: %g  |  total: %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb\n",
+		r.PortionCount, r.EnergyKcal, r.ProteinG, r.FatG, r.CarbG)
+	if len(r.Ingredients) > 0 {
+		b.WriteString("ingredients:\n")
+		for _, ing := range r.Ingredients {
+			fmt.Fprintf(&b, "  - %s", ing.Name)
+			if ing.Producer != "" {
+				fmt.Fprintf(&b, " (%s)", ing.Producer)
+			}
+			fmt.Fprintf(&b, ": %gg  [product_id: %s]\n", ing.AmountGrams, ing.ProductID)
+		}
+	}
+	if len(r.Instructions) > 0 {
+		b.WriteString("instructions:\n")
+		for i, step := range r.Instructions {
+			fmt.Fprintf(&b, "  %d. %s\n", i+1, step)
+		}
+	}
+	return b.String()
+}
+
+// --- create_recipe ---
+
+type IngredientInput struct {
+	ProductID   string  `json:"product_id" jsonschema:"Product UUID from search_products or get_product."`
+	AmountGrams float64 `json:"amount_grams" jsonschema:"Amount of this ingredient in the whole recipe, in grams (or ml for liquids)."`
+}
+
+type CreateRecipeInput struct {
+	User         string            `json:"user" jsonschema:"Which configured YAZIO account to create the recipe under."`
+	Name         string            `json:"name" jsonschema:"Name of the recipe, e.g. \"Borscht\" or \"Chicken with rice\"."`
+	Ingredients  []IngredientInput `json:"ingredients" jsonschema:"List of ingredients (at least 2). Each needs a product_id from search_products and the amount in grams used in the whole recipe."`
+	PortionCount int               `json:"portion_count,omitempty" jsonschema:"How many portions the recipe makes (defaults to 1). Whole numbers only."`
+	Instructions []string          `json:"instructions,omitempty" jsonschema:"Optional preparation steps, one string per step."`
+}
+
+type CreateRecipeOutput struct {
+	Created         bool    `json:"created"`
+	RecipeID        string  `json:"recipe_id"`
+	Name            string  `json:"name"`
+	PortionCount    int     `json:"portion_count"`
+	IngredientCount int     `json:"ingredient_count"`
+	EnergyKcal      float64 `json:"energy_kcal_total"`
+	ProteinG        float64 `json:"protein_g_total"`
+	FatG            float64 `json:"fat_g_total"`
+	CarbG           float64 `json:"carb_g_total"`
+}
+
+func createRecipeHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[CreateRecipeInput, CreateRecipeOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in CreateRecipeInput) (*mcp.CallToolResult, CreateRecipeOutput, error) {
+		client, err := resolveClient(clients, users, "create_recipe", in.User)
+		if err != nil {
+			return nil, CreateRecipeOutput{}, err
+		}
+		if strings.TrimSpace(in.Name) == "" {
+			return nil, CreateRecipeOutput{}, fmt.Errorf("create_recipe: name must not be empty")
+		}
+		if len(in.Ingredients) < 2 {
+			return nil, CreateRecipeOutput{}, fmt.Errorf("create_recipe: at least 2 ingredients required, got %d", len(in.Ingredients))
+		}
+		portionCount := in.PortionCount
+		if portionCount <= 0 {
+			portionCount = 1
+		}
+
+		// Resolve each ingredient: fetch its product to get name/producer/base_unit
+		// and scale its per-gram nutrients by the amount used in this recipe.
+		resolved := make([]yazio.RecipeIngredient, 0, len(in.Ingredients))
+		totalNutrients := yazio.Nutrients{}
+		for i, ing := range in.Ingredients {
+			if strings.TrimSpace(ing.ProductID) == "" {
+				return nil, CreateRecipeOutput{}, fmt.Errorf("create_recipe: ingredient %d: product_id must not be empty", i+1)
+			}
+			if ing.AmountGrams <= 0 {
+				return nil, CreateRecipeOutput{}, fmt.Errorf("create_recipe: ingredient %d: amount_grams must be positive, got %v", i+1, ing.AmountGrams)
+			}
+			p, err := client.GetProduct(ctx, ing.ProductID)
+			if err != nil {
+				return nil, CreateRecipeOutput{}, friendlyYazioError(fmt.Sprintf("create_recipe: ingredient %d (product_id %s)", i+1, ing.ProductID), in.User, err)
+			}
+			// Scale per-gram nutrient values by the amount this ingredient
+			// contributes to the recipe — YAZIO's recipe endpoint stores the
+			// client-submitted totals verbatim and does not recompute them.
+			for k, perGram := range p.Nutrients {
+				totalNutrients[k] += perGram * ing.AmountGrams
+			}
+			resolved = append(resolved, yazio.RecipeIngredient{
+				ProductID: ing.ProductID,
+				Name:      p.Name,
+				Producer:  p.Producer,
+				BaseUnit:  p.BaseUnit,
+				Amount:    ing.AmountGrams,
+			})
+		}
+
+		recipeID, err := client.CreateRecipe(ctx, in.Name, portionCount, resolved, totalNutrients, in.Instructions)
+		if err != nil {
+			return nil, CreateRecipeOutput{}, friendlyYazioError("create_recipe", in.User, err)
+		}
+
+		logger.Info("create_recipe", "user", in.User, "recipe_id", recipeID, "name", in.Name, "ingredients", len(resolved))
+
+		out := CreateRecipeOutput{
+			Created:         true,
+			RecipeID:        recipeID,
+			Name:            in.Name,
+			PortionCount:    portionCount,
+			IngredientCount: len(resolved),
+			EnergyKcal:      totalNutrients.EnergyKcalPerGram(),
+			ProteinG:        totalNutrients.ProteinPerGram(),
+			FatG:            totalNutrients.FatPerGram(),
+			CarbG:           totalNutrients.CarbPerGram(),
+		}
+		text := fmt.Sprintf("Created recipe %q (recipe_id: %s) with %d ingredient(s). Total: %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb.",
+			in.Name, recipeID, len(resolved), out.EnergyKcal, out.ProteinG, out.FatG, out.CarbG)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+	}
+}
+
+// --- delete_recipe ---
+
+type DeleteRecipeInput struct {
+	User     string `json:"user" jsonschema:"Which configured YAZIO account owns the recipe."`
+	RecipeID string `json:"recipe_id" jsonschema:"The recipe UUID to delete, from list_recipes."`
+}
+
+type DeleteRecipeOutput struct {
+	Deleted  bool   `json:"deleted"`
+	RecipeID string `json:"recipe_id"`
+}
+
+func deleteRecipeHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[DeleteRecipeInput, DeleteRecipeOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in DeleteRecipeInput) (*mcp.CallToolResult, DeleteRecipeOutput, error) {
+		client, err := resolveClient(clients, users, "delete_recipe", in.User)
+		if err != nil {
+			return nil, DeleteRecipeOutput{}, err
+		}
+		if strings.TrimSpace(in.RecipeID) == "" {
+			return nil, DeleteRecipeOutput{}, fmt.Errorf("delete_recipe: recipe_id must not be empty")
+		}
+
+		if err := client.DeleteRecipe(ctx, in.RecipeID); err != nil {
+			return nil, DeleteRecipeOutput{}, friendlyYazioError("delete_recipe", in.User, err)
+		}
+
+		logger.Info("delete_recipe", "user", in.User, "recipe_id", in.RecipeID)
+
+		out := DeleteRecipeOutput{Deleted: true, RecipeID: in.RecipeID}
+		text := fmt.Sprintf("Deleted recipe %s.", in.RecipeID)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+	}
+}
+
+// --- add_consumed_recipe ---
+
+type AddConsumedRecipeInput struct {
+	User     string  `json:"user" jsonschema:"Which configured YAZIO account's diary to log this recipe to."`
+	RecipeID string  `json:"recipe_id" jsonschema:"The recipe UUID, from list_recipes."`
+	Portions float64 `json:"portions" jsonschema:"How many portions to log. May be fractional (e.g. 0.5 for half, 2 for double)."`
+	MealType string  `json:"meal_type" jsonschema:"One of breakfast, lunch, dinner, snack."`
+	Date     string  `json:"date,omitempty" jsonschema:"Date the recipe was eaten, YYYY-MM-DD. Defaults to today if omitted."`
+}
+
+type AddConsumedRecipeOutput struct {
+	Logged   bool    `json:"logged"`
+	RecipeID string  `json:"recipe_id"`
+	Portions float64 `json:"portions"`
+	MealType string  `json:"meal_type"`
+	Date     string  `json:"date"`
+}
+
+func addConsumedRecipeHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[AddConsumedRecipeInput, AddConsumedRecipeOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in AddConsumedRecipeInput) (*mcp.CallToolResult, AddConsumedRecipeOutput, error) {
+		client, err := resolveClient(clients, users, "add_consumed_recipe", in.User)
+		if err != nil {
+			return nil, AddConsumedRecipeOutput{}, err
+		}
+		if strings.TrimSpace(in.RecipeID) == "" {
+			return nil, AddConsumedRecipeOutput{}, fmt.Errorf("add_consumed_recipe: recipe_id must not be empty")
+		}
+		if in.Portions <= 0 {
+			return nil, AddConsumedRecipeOutput{}, fmt.Errorf("add_consumed_recipe: portions must be positive, got %v", in.Portions)
+		}
+		if strings.TrimSpace(in.MealType) == "" {
+			return nil, AddConsumedRecipeOutput{}, fmt.Errorf("add_consumed_recipe: meal_type must not be empty")
+		}
+
+		date, err := parseDateOrToday(in.Date)
+		if err != nil {
+			return nil, AddConsumedRecipeOutput{}, fmt.Errorf("add_consumed_recipe: %w", err)
+		}
+
+		mealType := strings.ToLower(strings.TrimSpace(in.MealType))
+		if err := client.AddConsumedRecipePortion(ctx, in.RecipeID, in.Portions, mealType, date); err != nil {
+			return nil, AddConsumedRecipeOutput{}, friendlyYazioError("add_consumed_recipe", in.User, err)
+		}
+
+		dateStr := date.Format(dateLayout)
+		logger.Info("add_consumed_recipe", "user", in.User, "recipe_id", in.RecipeID, "portions", in.Portions, "meal_type", mealType, "date", dateStr)
+
+		out := AddConsumedRecipeOutput{Logged: true, RecipeID: in.RecipeID, Portions: in.Portions, MealType: mealType, Date: dateStr}
+		text := fmt.Sprintf("Logged %g portion(s) of recipe %s as %s on %s.", in.Portions, in.RecipeID, mealType, dateStr)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+	}
+}
+
+// --- remove_consumed_recipe ---
+
+type RemoveConsumedRecipeInput struct {
+	User    string `json:"user" jsonschema:"Which configured YAZIO account's diary to delete the entry from."`
+	EntryID string `json:"entry_id" jsonschema:"The recipe-portion diary entry ID to delete, as returned by get_consumed_items's recipe_portions list (entry_id field, not recipe_id)."`
+}
+
+type RemoveConsumedRecipeOutput struct {
+	Removed bool   `json:"removed"`
+	EntryID string `json:"entry_id"`
+}
+
+func removeConsumedRecipeHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[RemoveConsumedRecipeInput, RemoveConsumedRecipeOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in RemoveConsumedRecipeInput) (*mcp.CallToolResult, RemoveConsumedRecipeOutput, error) {
+		client, err := resolveClient(clients, users, "remove_consumed_recipe", in.User)
+		if err != nil {
+			return nil, RemoveConsumedRecipeOutput{}, err
+		}
+		if strings.TrimSpace(in.EntryID) == "" {
+			return nil, RemoveConsumedRecipeOutput{}, fmt.Errorf("remove_consumed_recipe: entry_id must not be empty")
+		}
+
+		if err := client.RemoveConsumedRecipePortion(ctx, in.EntryID); err != nil {
+			return nil, RemoveConsumedRecipeOutput{}, friendlyYazioError("remove_consumed_recipe", in.User, err)
+		}
+
+		logger.Info("remove_consumed_recipe", "user", in.User, "entry_id", in.EntryID)
+
+		out := RemoveConsumedRecipeOutput{Removed: true, EntryID: in.EntryID}
+		text := fmt.Sprintf("Deleted recipe diary entry %s.", in.EntryID)
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
 	}
 }

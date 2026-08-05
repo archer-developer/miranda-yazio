@@ -86,3 +86,49 @@ type ConsumedItem struct {
 	Serving         string  `json:"serving,omitempty"`
 	ServingQuantity float64 `json:"serving_quantity,omitempty"`
 }
+
+// ConsumedRecipePortion is one recipe-portion diary entry, as returned in
+// the recipe_portions field of GetConsumedItems. Use its ID with
+// RemoveConsumedRecipePortion to delete it (not RemoveConsumedItem, which
+// is for product entries only).
+type ConsumedRecipePortion struct {
+	ID           string  `json:"id"`
+	RecipeID     string  `json:"recipe_id"`
+	Date         string  `json:"date"`
+	Daytime      string  `json:"daytime"`
+	PortionCount float64 `json:"portion_count"`
+}
+
+// RecipeIngredient is one ingredient spec passed to CreateRecipe. The
+// product fields (Name, Producer, BaseUnit) must already be resolved from
+// GetProduct — YAZIO stores them verbatim in the recipe and does not look
+// them up itself.
+type RecipeIngredient struct {
+	ProductID string
+	Name      string
+	Producer  string
+	BaseUnit  string
+	Amount    float64 // grams (or ml for liquid products)
+}
+
+// Recipe is a YAZIO recipe as returned by GetRecipe. Nutrients holds the
+// total for the whole recipe; divide by PortionCount for per-portion values.
+type Recipe struct {
+	ID            string
+	Name          string
+	PortionCount  float64
+	Nutrients     Nutrients
+	Servings      []RecipeServing
+	Instructions  []string
+	IsYazioRecipe bool
+}
+
+// RecipeServing is one ingredient within a full recipe as returned by
+// GetRecipe.
+type RecipeServing struct {
+	ProductID string
+	Name      string
+	Producer  string
+	BaseUnit  string
+	Amount    float64
+}
