@@ -66,6 +66,11 @@ type fakeYazioClient struct {
 	removeRecipePortionErr     error
 	removeRecipePortionCalled  bool
 	gotRemoveRecipeEntryID     string
+
+	dailyGoals    yazio.Nutrients
+	dailyGoalsErr error
+
+	getProductCallCount int
 }
 
 func (f *fakeYazioClient) SearchProducts(_ context.Context, query string) ([]yazio.Product, error) {
@@ -75,6 +80,7 @@ func (f *fakeYazioClient) SearchProducts(_ context.Context, query string) ([]yaz
 
 func (f *fakeYazioClient) GetProduct(_ context.Context, id string) (*yazio.Product, error) {
 	f.gotID = id
+	f.getProductCallCount++
 	return f.product, f.productErr
 }
 
@@ -134,6 +140,10 @@ func (f *fakeYazioClient) RemoveConsumedRecipePortion(_ context.Context, entryID
 	f.removeRecipePortionCalled = true
 	f.gotRemoveRecipeEntryID = entryID
 	return f.removeRecipePortionErr
+}
+
+func (f *fakeYazioClient) GetDailyGoals(_ context.Context, _ time.Time) (yazio.Nutrients, error) {
+	return f.dailyGoals, f.dailyGoalsErr
 }
 
 func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
@@ -668,4 +678,87 @@ func TestFriendlyYazioError_PreservesErrorsIs(t *testing.T) {
 func TestFriendlyYazioError_NamesTheUserOnAuthFailure(t *testing.T) {
 	wrapped := friendlyYazioError("some_action", "archer", yazio.ErrInvalidCredentials)
 	assert.ErrorContains(t, wrapped, "archer")
+}
+
+// --- get_daily_summary ---
+
+func TestGetDailySummaryHandler_ComputesTotalsAndRemaining(t *testing.T) {
+	// One product entry (p1, 100g) + one recipe portion (r1, 2 of 4 portions).
+	// product p1: 2 kcal/g, 0.3g protein/g → consumed from products: 200 kcal, 30g protein
+	// recipe r1: 400 kcal total, 40g protein total, 4 portions →
+	//   2 portions logged = 400*(2/4)=200 kcal, 40*(2/4)=20g protein
+	// Total consumed: 400 kcal, 50g protein
+	// Goals: 2000 kcal, 150g protein → remaining: 1600 kcal, 100g protein
+	client := &fakeYazioClient{
+		consumedItems: []yazio.ConsumedItem{
+			{ID: "i1", ProductID: "p1", Amount: 100},
+		},
+		recipePortions: []yazio.ConsumedRecipePortion{
+			{ID: "r1", RecipeID: "rec1", PortionCount: 2},
+		},
+		product: &yazio.Product{
+			ID:       "p1",
+			BaseUnit: "g",
+			Nutrients: yazio.Nutrients{
+				yazio.NutrientEnergyKcal: 2.0,
+				yazio.NutrientProtein:    0.3,
+			},
+		},
+		recipe: &yazio.Recipe{
+			ID:           "rec1",
+			PortionCount: 4,
+			Nutrients: yazio.Nutrients{
+				yazio.NutrientEnergyKcal: 400,
+				yazio.NutrientProtein:    40,
+			},
+		},
+		dailyGoals: yazio.Nutrients{
+			yazio.NutrientEnergyKcal: 2000,
+			yazio.NutrientProtein:    150,
+		},
+	}
+	clients := clientsOf(client)
+	handler := getDailySummaryHandler(clients, usersOf(clients), testLogger())
+
+	_, out, err := handler(context.Background(), nil, GetDailySummaryInput{User: testUser, Date: "2024-01-15"})
+	require.NoError(t, err)
+	assert.Equal(t, "2024-01-15", out.Date)
+	assert.InDelta(t, 400.0, out.Consumed.EnergyKcal, 0.01, "product 200 + recipe 200")
+	assert.InDelta(t, 50.0, out.Consumed.ProteinG, 0.01, "product 30 + recipe 20")
+	assert.InDelta(t, 2000.0, out.Goals.EnergyKcal, 0.01)
+	assert.InDelta(t, 150.0, out.Goals.ProteinG, 0.01)
+	assert.InDelta(t, 1600.0, out.Remaining.EnergyKcal, 0.01)
+	assert.InDelta(t, 100.0, out.Remaining.ProteinG, 0.01)
+}
+
+func TestGetDailySummaryHandler_DeduplicatesProductCalls(t *testing.T) {
+	// Two diary entries with the same product_id — GetProduct should be called once.
+	client := &fakeYazioClient{
+		consumedItems: []yazio.ConsumedItem{
+			{ID: "i1", ProductID: "p1", Amount: 100},
+			{ID: "i2", ProductID: "p1", Amount: 200},
+		},
+		product: &yazio.Product{
+			ID:        "p1",
+			BaseUnit:  "g",
+			Nutrients: yazio.Nutrients{yazio.NutrientEnergyKcal: 1.0},
+		},
+		dailyGoals: yazio.Nutrients{},
+	}
+	clients := clientsOf(client)
+	handler := getDailySummaryHandler(clients, usersOf(clients), testLogger())
+
+	_, out, err := handler(context.Background(), nil, GetDailySummaryInput{User: testUser})
+	require.NoError(t, err)
+	assert.Equal(t, 1, client.getProductCallCount, "GetProduct called once despite two entries with the same product_id")
+	assert.InDelta(t, 300.0, out.Consumed.EnergyKcal, 0.01, "100g + 200g at 1 kcal/g")
+}
+
+func TestGetDailySummaryHandler_RejectsUnknownUser(t *testing.T) {
+	clients := clientsOf(&fakeYazioClient{})
+	handler := getDailySummaryHandler(clients, usersOf(clients), testLogger())
+
+	_, _, err := handler(context.Background(), nil, GetDailySummaryInput{User: "nobody"})
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "nobody")
 }

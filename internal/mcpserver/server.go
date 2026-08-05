@@ -1,7 +1,7 @@
 // Package mcpserver registers this service's MCP tools and wires them to
 // internal/yazio, the YAZIO API client.
 //
-// Tools are grouped into two flows:
+// Tools are grouped into three flows:
 //
 //   - Product diary flow (5 tools): search_products → get_product →
 //     add_consumed_item; get_consumed_items reads back; remove_consumed_item
@@ -11,6 +11,11 @@
 //     dish; list_recipes / get_recipe browse what exists; add_consumed_recipe
 //     logs portions of a recipe to the diary; remove_consumed_recipe corrects
 //     a mistake; delete_recipe removes the recipe itself.
+//
+//   - Summary (1 tool): get_daily_summary fetches the full diary and daily
+//     goals in one call and returns consumed / goals / remaining macros
+//     computed server-side, avoiding the slow LLM tool-loop that would
+//     otherwise be needed for 20-30 diary entries.
 //
 // This service is not single-tenant: it holds a live YazioClient for each
 // configured household member, and every tool takes a required "user"
@@ -61,9 +66,12 @@ type YazioClient interface {
 	DeleteRecipe(ctx context.Context, id string) error
 	AddConsumedRecipePortion(ctx context.Context, recipeID string, portions float64, mealType string, date time.Time) error
 	RemoveConsumedRecipePortion(ctx context.Context, entryID string) error
+
+	// Goals and summary.
+	GetDailyGoals(ctx context.Context, date time.Time) (yazio.Nutrients, error)
 }
 
-// New builds and returns the MCP server with all five YAZIO tools
+// New builds and returns the MCP server with all twelve YAZIO tools
 // registered. clients maps a configured user name (as set in
 // config.yaml's yazio.users[].name) to the YazioClient acting on that
 // account — every tool's "user" input is resolved against this map. A nil
@@ -176,6 +184,18 @@ func New(clients map[string]YazioClient, logger *slog.Logger) *mcp.Server {
 			"Use this to correct a mistaken add_consumed_recipe call." +
 			userHint,
 	}, removeConsumedRecipeHandler(clients, users, logger))
+
+	// --- summary ---
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "get_daily_summary",
+		Description: "Returns calories and macros (protein, fat, carb) consumed today (or a given date), " +
+			"the user's configured daily goals, and what remains — all computed server-side in a single call. " +
+			"Use this instead of looping through get_consumed_items + get_product for every entry: " +
+			"the server fetches the full diary and product/recipe nutrition itself, which is much faster than " +
+			"an LLM tool loop over 20–30 diary entries." +
+			userHint,
+	}, getDailySummaryHandler(clients, users, logger))
 
 	return server
 }
@@ -991,4 +1011,135 @@ func removeConsumedRecipeHandler(clients map[string]YazioClient, users []string,
 		text := fmt.Sprintf("Deleted recipe diary entry %s.", in.EntryID)
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
 	}
+}
+
+// --- get_daily_summary ---
+
+// NutrientTotals holds the four key macros as absolute amounts (kcal / g),
+// used for consumed totals, daily goals, and the remaining difference.
+type NutrientTotals struct {
+	EnergyKcal float64 `json:"energy_kcal"`
+	ProteinG   float64 `json:"protein_g"`
+	FatG       float64 `json:"fat_g"`
+	CarbG      float64 `json:"carb_g"`
+}
+
+type GetDailySummaryInput struct {
+	User string `json:"user" jsonschema:"Which configured YAZIO account to summarize."`
+	Date string `json:"date,omitempty" jsonschema:"Date to summarize, YYYY-MM-DD. Defaults to today if omitted."`
+}
+
+type GetDailySummaryOutput struct {
+	Date      string         `json:"date"`
+	Consumed  NutrientTotals `json:"consumed"`
+	Goals     NutrientTotals `json:"goals"`
+	Remaining NutrientTotals `json:"remaining"`
+}
+
+func getDailySummaryHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[GetDailySummaryInput, GetDailySummaryOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in GetDailySummaryInput) (*mcp.CallToolResult, GetDailySummaryOutput, error) {
+		client, err := resolveClient(clients, users, "get_daily_summary", in.User)
+		if err != nil {
+			return nil, GetDailySummaryOutput{}, err
+		}
+
+		date, err := parseDateOrToday(in.Date)
+		if err != nil {
+			return nil, GetDailySummaryOutput{}, fmt.Errorf("get_daily_summary: %w", err)
+		}
+
+		productEntries, recipePortions, err := client.GetConsumedItems(ctx, date)
+		if err != nil {
+			return nil, GetDailySummaryOutput{}, friendlyYazioError("get_daily_summary", in.User, err)
+		}
+
+		// Fetch each unique product once and accumulate consumed nutrients.
+		// Products that appear multiple times in the diary (same product logged
+		// at different meals) are deduplicated to avoid redundant API calls.
+		consumed := yazio.Nutrients{}
+		productCache := make(map[string]*yazio.Product, len(productEntries))
+		for _, item := range productEntries {
+			if _, ok := productCache[item.ProductID]; !ok {
+				p, err := client.GetProduct(ctx, item.ProductID)
+				if err != nil {
+					return nil, GetDailySummaryOutput{}, friendlyYazioError(
+						fmt.Sprintf("get_daily_summary: fetching product %s", item.ProductID), in.User, err)
+				}
+				productCache[item.ProductID] = p
+			}
+			p := productCache[item.ProductID]
+			for k, perGram := range p.Nutrients {
+				consumed[k] += perGram * item.Amount
+			}
+		}
+
+		// Same deduplication for recipes.
+		recipeCache := make(map[string]*yazio.Recipe, len(recipePortions))
+		for _, portion := range recipePortions {
+			if _, ok := recipeCache[portion.RecipeID]; !ok {
+				r, err := client.GetRecipe(ctx, portion.RecipeID)
+				if err != nil {
+					return nil, GetDailySummaryOutput{}, friendlyYazioError(
+						fmt.Sprintf("get_daily_summary: fetching recipe %s", portion.RecipeID), in.User, err)
+				}
+				recipeCache[portion.RecipeID] = r
+			}
+			r := recipeCache[portion.RecipeID]
+			// Recipe.Nutrients holds whole-recipe totals; scale by the logged
+			// fraction of portions (portionCount / recipe.PortionCount).
+			divisor := r.PortionCount
+			if divisor <= 0 {
+				divisor = 1
+			}
+			for k, recipeTotal := range r.Nutrients {
+				consumed[k] += recipeTotal * portion.PortionCount / divisor
+			}
+		}
+
+		goals, err := client.GetDailyGoals(ctx, date)
+		if err != nil {
+			return nil, GetDailySummaryOutput{}, friendlyYazioError("get_daily_summary: fetching goals", in.User, err)
+		}
+
+		dateStr := date.Format(dateLayout)
+		consumedTotals := NutrientTotals{
+			EnergyKcal: consumed.EnergyKcalPerGram(),
+			ProteinG:   consumed.ProteinPerGram(),
+			FatG:       consumed.FatPerGram(),
+			CarbG:      consumed.CarbPerGram(),
+		}
+		// goals is a Nutrients map whose values are absolute daily targets
+		// (same dotted keys, but kcal/g totals, not per-gram rates).
+		goalTotals := NutrientTotals{
+			EnergyKcal: goals.EnergyKcalPerGram(),
+			ProteinG:   goals.ProteinPerGram(),
+			FatG:       goals.FatPerGram(),
+			CarbG:      goals.CarbPerGram(),
+		}
+		remaining := NutrientTotals{
+			EnergyKcal: goalTotals.EnergyKcal - consumedTotals.EnergyKcal,
+			ProteinG:   goalTotals.ProteinG - consumedTotals.ProteinG,
+			FatG:       goalTotals.FatG - consumedTotals.FatG,
+			CarbG:      goalTotals.CarbG - consumedTotals.CarbG,
+		}
+
+		logger.Info("get_daily_summary", "user", in.User, "date", dateStr,
+			"products", len(productEntries), "recipe_portions", len(recipePortions),
+			"consumed_kcal", consumedTotals.EnergyKcal, "goal_kcal", goalTotals.EnergyKcal)
+
+		out := GetDailySummaryOutput{Date: dateStr, Consumed: consumedTotals, Goals: goalTotals, Remaining: remaining}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: formatDailySummary(out)}}}, out, nil
+	}
+}
+
+func formatDailySummary(out GetDailySummaryOutput) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Daily summary for %s\n\n", out.Date)
+	fmt.Fprintf(&b, "Consumed:  %.0f kcal | protein %.1fg | fat %.1fg | carbs %.1fg\n",
+		out.Consumed.EnergyKcal, out.Consumed.ProteinG, out.Consumed.FatG, out.Consumed.CarbG)
+	fmt.Fprintf(&b, "Goals:     %.0f kcal | protein %.1fg | fat %.1fg | carbs %.1fg\n",
+		out.Goals.EnergyKcal, out.Goals.ProteinG, out.Goals.FatG, out.Goals.CarbG)
+	fmt.Fprintf(&b, "Remaining: %.0f kcal | protein %.1fg | fat %.1fg | carbs %.1fg\n",
+		out.Remaining.EnergyKcal, out.Remaining.ProteinG, out.Remaining.FatG, out.Remaining.CarbG)
+	return b.String()
 }

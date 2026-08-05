@@ -61,7 +61,7 @@ curl -fsS "$base_url/healthz" >/dev/null && pass "service is up" || fail "is the
 echo "==> tools/list"
 tools_result="$("$smoke_dir/mcp-call.sh" "$smoke_dir/requests/tools_list.json" | extract_result)"
 tool_count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tools"]))' <<<"$tools_result")"
-[ "$tool_count" -eq 11 ] && pass "11 tools registered" || fail "expected 11 tools, got $tool_count"
+[ "$tool_count" -eq 12 ] && pass "12 tools registered" || fail "expected 12 tools, got $tool_count"
 
 # -----------------------------------------------------------------------
 # Product flow
@@ -206,6 +206,32 @@ ids = [r['recipe_id'] for r in d['recipes']]
 assert '$recipe_id' not in ids, f'deleted recipe $recipe_id still appears in list_recipes'
 " <<<"$list_after"
 pass "recipe is gone from list_recipes"
+
+# -----------------------------------------------------------------------
+# Daily summary
+# -----------------------------------------------------------------------
+
+echo
+echo "--- daily summary ---"
+
+echo "==> get_daily_summary (today)"
+summary_req="$(python3 -c "import json; print(json.dumps({'jsonrpc':'2.0','id':30,'method':'tools/call','params':{'name':'get_daily_summary','arguments':{'user':'archer'}}}))")"
+summary_result="$(echo "$summary_req" | "$smoke_dir/mcp-call.sh" | extract_result)"
+python3 -c "
+import json, sys
+d = json.load(sys.stdin)['structuredContent']
+assert 'consumed' in d, 'missing consumed field'
+assert 'goals' in d, 'missing goals field'
+assert 'remaining' in d, 'missing remaining field'
+assert 'energy_kcal' in d['consumed'], 'missing consumed.energy_kcal'
+assert 'energy_kcal' in d['goals'], 'missing goals.energy_kcal'
+assert 'energy_kcal' in d['remaining'], 'missing remaining.energy_kcal'
+# goals should be non-zero if the user has configured them in YAZIO
+assert d['goals']['energy_kcal'] > 0, f\"goals.energy_kcal is 0 — check that archer's YAZIO account has daily goals configured\"
+" <<<"$summary_result"
+consumed_kcal="$(python3 -c 'import json,sys; print(round(json.load(sys.stdin)["structuredContent"]["consumed"]["energy_kcal"]))' <<<"$summary_result")"
+remaining_kcal="$(python3 -c 'import json,sys; print(round(json.load(sys.stdin)["structuredContent"]["remaining"]["energy_kcal"]))' <<<"$summary_result")"
+pass "summary returned: consumed ${consumed_kcal} kcal, remaining ${remaining_kcal} kcal"
 
 echo
 echo "All smoke tests passed."
