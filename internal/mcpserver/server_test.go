@@ -30,6 +30,14 @@ type fakeYazioClient struct {
 	consumedErr    error
 	gotDate        time.Time
 
+	// consumedItemsByDate lets get_consumed_items_range tests fake a
+	// different diary per day. When nil, GetConsumedItems falls back to
+	// the single consumedItems/recipePortions/consumedErr fields above
+	// for every date (unchanged behavior for single-date tests). gotDates
+	// records every date GetConsumedItems was called with, in call order.
+	consumedItemsByDate map[string]fakeDayResponse
+	gotDates            []time.Time
+
 	addErr       error
 	gotProductID string
 	gotAmount    float64
@@ -71,6 +79,15 @@ type fakeYazioClient struct {
 	dailyGoalsErr error
 
 	getProductCallCount int
+	getRecipeCallCount  int
+}
+
+// fakeDayResponse is one day's fake GetConsumedItems response, keyed by
+// dateLayout-formatted date string in fakeYazioClient.consumedItemsByDate.
+type fakeDayResponse struct {
+	items    []yazio.ConsumedItem
+	portions []yazio.ConsumedRecipePortion
+	err      error
 }
 
 func (f *fakeYazioClient) SearchProducts(_ context.Context, query string) ([]yazio.Product, error) {
@@ -86,6 +103,14 @@ func (f *fakeYazioClient) GetProduct(_ context.Context, id string) (*yazio.Produ
 
 func (f *fakeYazioClient) GetConsumedItems(_ context.Context, date time.Time) ([]yazio.ConsumedItem, []yazio.ConsumedRecipePortion, error) {
 	f.gotDate = date
+	f.gotDates = append(f.gotDates, date)
+	if f.consumedItemsByDate != nil {
+		day, ok := f.consumedItemsByDate[date.Format(dateLayout)]
+		if !ok {
+			return nil, nil, nil
+		}
+		return day.items, day.portions, day.err
+	}
 	return f.consumedItems, f.recipePortions, f.consumedErr
 }
 
@@ -110,6 +135,7 @@ func (f *fakeYazioClient) ListRecipes(_ context.Context) ([]string, error) {
 
 func (f *fakeYazioClient) GetRecipe(_ context.Context, id string) (*yazio.Recipe, error) {
 	f.gotRecipeID = id
+	f.getRecipeCallCount++
 	return f.recipe, f.getRecipeErr
 }
 
@@ -273,61 +299,6 @@ func TestGetProductHandler_WrapsNotFound(t *testing.T) {
 
 	_, _, err := handler(context.Background(), nil, GetProductInput{User: testUser, ProductID: "missing"})
 	assert.ErrorIs(t, err, yazio.ErrNotFound)
-}
-
-// --- get_consumed_items ---
-
-func TestGetConsumedItemsHandler_DefaultsDateToToday(t *testing.T) {
-	client := &fakeYazioClient{}
-	clients := clientsOf(client)
-	handler := getConsumedItemsHandler(clients, usersOf(clients), testLogger())
-
-	before := time.Now()
-	_, out, err := handler(context.Background(), nil, GetConsumedItemsInput{User: testUser})
-	require.NoError(t, err)
-	assert.Equal(t, before.Format(dateLayout), out.Date)
-	assert.Equal(t, before.Format(dateLayout), client.gotDate.Format(dateLayout))
-}
-
-func TestGetConsumedItemsHandler_ParsesGivenDate(t *testing.T) {
-	client := &fakeYazioClient{
-		consumedItems: []yazio.ConsumedItem{
-			{ID: "i1", ProductID: "p1", Daytime: "lunch", Amount: 140, Serving: "piece", ServingQuantity: 2},
-		},
-		recipePortions: []yazio.ConsumedRecipePortion{
-			{ID: "r1", RecipeID: "rec1", Daytime: "lunch", PortionCount: 1.5},
-		},
-	}
-	clients := clientsOf(client)
-	handler := getConsumedItemsHandler(clients, usersOf(clients), testLogger())
-
-	_, out, err := handler(context.Background(), nil, GetConsumedItemsInput{User: testUser, Date: "2024-01-15"})
-	require.NoError(t, err)
-	assert.Equal(t, "2024-01-15", out.Date)
-	assert.Equal(t, "2024-01-15", client.gotDate.Format(dateLayout))
-	require.Len(t, out.Items, 1)
-	assert.Equal(t, 140.0, out.Items[0].AmountGrams)
-	require.Len(t, out.RecipePortions, 1)
-	assert.Equal(t, "r1", out.RecipePortions[0].EntryID)
-	assert.Equal(t, "rec1", out.RecipePortions[0].RecipeID)
-	assert.Equal(t, 1.5, out.RecipePortions[0].PortionCount)
-	assert.Equal(t, 2, out.Total, "total counts both products and recipe portions")
-}
-
-func TestGetConsumedItemsHandler_RejectsMalformedDate(t *testing.T) {
-	clients := clientsOf(&fakeYazioClient{})
-	handler := getConsumedItemsHandler(clients, usersOf(clients), testLogger())
-
-	_, _, err := handler(context.Background(), nil, GetConsumedItemsInput{User: testUser, Date: "15/01/2024"})
-	assert.Error(t, err)
-}
-
-func TestGetConsumedItemsHandler_RejectsUnknownUser(t *testing.T) {
-	clients := clientsOf(&fakeYazioClient{})
-	handler := getConsumedItemsHandler(clients, usersOf(clients), testLogger())
-
-	_, _, err := handler(context.Background(), nil, GetConsumedItemsInput{User: "nobody"})
-	assert.Error(t, err)
 }
 
 // --- add_consumed_item ---
@@ -759,6 +730,210 @@ func TestGetDailySummaryHandler_RejectsUnknownUser(t *testing.T) {
 	handler := getDailySummaryHandler(clients, usersOf(clients), testLogger())
 
 	_, _, err := handler(context.Background(), nil, GetDailySummaryInput{User: "nobody"})
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "nobody")
+}
+
+// --- get_consumed_items_range ---
+
+func TestGetConsumedItemsRangeHandler_DefaultsToTodayWhenBothOmitted(t *testing.T) {
+	client := &fakeYazioClient{}
+	clients := clientsOf(client)
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	before := time.Now()
+	_, out, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{User: testUser})
+	require.NoError(t, err)
+	assert.Equal(t, before.Format(dateLayout), out.StartDate)
+	assert.Equal(t, before.Format(dateLayout), out.EndDate)
+	require.Len(t, out.Days, 1)
+	require.Len(t, client.gotDates, 1)
+	assert.Equal(t, before.Format(dateLayout), client.gotDates[0].Format(dateLayout))
+}
+
+func TestGetConsumedItemsRangeHandler_DefaultsEndDateToStartDate(t *testing.T) {
+	client := &fakeYazioClient{}
+	clients := clientsOf(client)
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	_, out, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{User: testUser, StartDate: "2024-01-15"})
+	require.NoError(t, err)
+	assert.Equal(t, "2024-01-15", out.StartDate)
+	assert.Equal(t, "2024-01-15", out.EndDate)
+	require.Len(t, out.Days, 1)
+	require.Len(t, client.gotDates, 1)
+	assert.Equal(t, "2024-01-15", client.gotDates[0].Format(dateLayout))
+}
+
+func TestGetConsumedItemsRangeHandler_RejectsEndDateWithoutStartDate(t *testing.T) {
+	clients := clientsOf(&fakeYazioClient{})
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	_, _, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{User: testUser, EndDate: "2024-01-15"})
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "start_date")
+}
+
+func TestGetConsumedItemsRangeHandler_RejectsEndBeforeStart(t *testing.T) {
+	clients := clientsOf(&fakeYazioClient{})
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	_, _, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{
+		User: testUser, StartDate: "2024-01-20", EndDate: "2024-01-10",
+	})
+	assert.Error(t, err)
+}
+
+func TestGetConsumedItemsRangeHandler_RejectsRangeOverCap(t *testing.T) {
+	clients := clientsOf(&fakeYazioClient{})
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	// 2024-01-01 to 2024-02-05 spans 36 days, over the 31-day cap.
+	_, _, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{
+		User: testUser, StartDate: "2024-01-01", EndDate: "2024-02-05",
+	})
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "31")
+}
+
+func TestGetConsumedItemsRangeHandler_IncludesEmptyDaysInRange(t *testing.T) {
+	// A 3-day range with entries only on day 1 and day 3 — day 2 must still
+	// appear in the output, with empty items/recipe_portions and a zero total.
+	client := &fakeYazioClient{
+		consumedItemsByDate: map[string]fakeDayResponse{
+			"2024-01-01": {items: []yazio.ConsumedItem{{ID: "i1", ProductID: "p1", Amount: 100}}},
+			"2024-01-03": {items: []yazio.ConsumedItem{{ID: "i2", ProductID: "p1", Amount: 100}}},
+		},
+		product: &yazio.Product{ID: "p1", BaseUnit: "g", Nutrients: yazio.Nutrients{yazio.NutrientEnergyKcal: 1.0}},
+	}
+	clients := clientsOf(client)
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	_, out, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{
+		User: testUser, StartDate: "2024-01-01", EndDate: "2024-01-03",
+	})
+	require.NoError(t, err)
+	require.Len(t, out.Days, 3)
+	assert.Equal(t, "2024-01-01", out.Days[0].Date)
+	assert.Equal(t, "2024-01-02", out.Days[1].Date)
+	assert.Equal(t, "2024-01-03", out.Days[2].Date)
+	assert.Empty(t, out.Days[1].Items)
+	assert.Empty(t, out.Days[1].RecipePortions)
+	assert.Zero(t, out.Days[1].Totals.EnergyKcal)
+	require.Len(t, client.gotDates, 3)
+}
+
+func TestGetConsumedItemsRangeHandler_ResolvesPerItemMacrosAndTotals(t *testing.T) {
+	// Same fixture as TestGetDailySummaryHandler_ComputesTotalsAndRemaining,
+	// split across a 2-day range: day 1 has the product entry, day 2 has
+	// the recipe portion. Grand total must equal the sum of both days.
+	client := &fakeYazioClient{
+		consumedItemsByDate: map[string]fakeDayResponse{
+			"2024-01-15": {items: []yazio.ConsumedItem{{ID: "i1", ProductID: "p1", Amount: 100}}},
+			"2024-01-16": {portions: []yazio.ConsumedRecipePortion{{ID: "r1", RecipeID: "rec1", PortionCount: 2}}},
+		},
+		product: &yazio.Product{
+			ID:       "p1",
+			BaseUnit: "g",
+			Nutrients: yazio.Nutrients{
+				yazio.NutrientEnergyKcal: 2.0,
+				yazio.NutrientProtein:    0.3,
+			},
+		},
+		recipe: &yazio.Recipe{
+			ID:           "rec1",
+			Name:         "Borscht",
+			PortionCount: 4,
+			Nutrients: yazio.Nutrients{
+				yazio.NutrientEnergyKcal: 400,
+				yazio.NutrientProtein:    40,
+			},
+		},
+	}
+	clients := clientsOf(client)
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	_, out, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{
+		User: testUser, StartDate: "2024-01-15", EndDate: "2024-01-16",
+	})
+	require.NoError(t, err)
+	require.Len(t, out.Days, 2)
+
+	require.Len(t, out.Days[0].Items, 1)
+	assert.Equal(t, "p1", out.Days[0].Items[0].ProductID)
+	assert.InDelta(t, 200.0, out.Days[0].Items[0].EnergyKcal, 0.01, "100g at 2 kcal/g")
+	assert.InDelta(t, 200.0, out.Days[0].Totals.EnergyKcal, 0.01)
+
+	require.Len(t, out.Days[1].RecipePortions, 1)
+	assert.Equal(t, "rec1", out.Days[1].RecipePortions[0].RecipeID)
+	assert.Equal(t, "Borscht", out.Days[1].RecipePortions[0].Name)
+	assert.InDelta(t, 200.0, out.Days[1].RecipePortions[0].EnergyKcal, 0.01, "2 of 4 portions of 400 kcal")
+	assert.InDelta(t, 200.0, out.Days[1].Totals.EnergyKcal, 0.01)
+
+	assert.InDelta(t, 400.0, out.Total.EnergyKcal, 0.01, "200 (product) + 200 (recipe)")
+	assert.InDelta(t, 50.0, out.Total.ProteinG, 0.01, "30 (product) + 20 (recipe)")
+}
+
+func TestGetConsumedItemsRangeHandler_DeduplicatesProductAndRecipeAcrossDays(t *testing.T) {
+	// Same product_id and recipe_id logged on each of 3 different days —
+	// GetProduct/GetRecipe should each be called exactly once across the
+	// whole range, not once per day.
+	client := &fakeYazioClient{
+		consumedItemsByDate: map[string]fakeDayResponse{
+			"2024-01-01": {
+				items:    []yazio.ConsumedItem{{ID: "i1", ProductID: "p1", Amount: 100}},
+				portions: []yazio.ConsumedRecipePortion{{ID: "r1", RecipeID: "rec1", PortionCount: 1}},
+			},
+			"2024-01-02": {
+				items:    []yazio.ConsumedItem{{ID: "i2", ProductID: "p1", Amount: 100}},
+				portions: []yazio.ConsumedRecipePortion{{ID: "r2", RecipeID: "rec1", PortionCount: 1}},
+			},
+			"2024-01-03": {
+				items:    []yazio.ConsumedItem{{ID: "i3", ProductID: "p1", Amount: 100}},
+				portions: []yazio.ConsumedRecipePortion{{ID: "r3", RecipeID: "rec1", PortionCount: 1}},
+			},
+		},
+		product: &yazio.Product{ID: "p1", BaseUnit: "g", Nutrients: yazio.Nutrients{yazio.NutrientEnergyKcal: 1.0}},
+		recipe:  &yazio.Recipe{ID: "rec1", PortionCount: 4, Nutrients: yazio.Nutrients{yazio.NutrientEnergyKcal: 400}},
+	}
+	clients := clientsOf(client)
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	_, _, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{
+		User: testUser, StartDate: "2024-01-01", EndDate: "2024-01-03",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, client.getProductCallCount, "GetProduct called once despite 3 days referencing the same product")
+	assert.Equal(t, 1, client.getRecipeCallCount, "GetRecipe called once despite 3 days referencing the same recipe")
+}
+
+func TestGetConsumedItemsRangeHandler_PropagatesFriendlyErrorOnConsumedItemsFailure(t *testing.T) {
+	client := &fakeYazioClient{consumedErr: yazio.ErrRateLimited}
+	clients := clientsOf(client)
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	_, _, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{User: testUser})
+	assert.ErrorIs(t, err, yazio.ErrRateLimited)
+}
+
+func TestGetConsumedItemsRangeHandler_PropagatesFriendlyErrorOnProductFailure(t *testing.T) {
+	client := &fakeYazioClient{
+		consumedItems: []yazio.ConsumedItem{{ID: "i1", ProductID: "p1", Amount: 100}},
+		productErr:    yazio.ErrNotFound,
+	}
+	clients := clientsOf(client)
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	_, _, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{User: testUser})
+	assert.ErrorIs(t, err, yazio.ErrNotFound)
+	assert.ErrorContains(t, err, "p1")
+}
+
+func TestGetConsumedItemsRangeHandler_RejectsUnknownUser(t *testing.T) {
+	clients := clientsOf(&fakeYazioClient{})
+	handler := getConsumedItemsRangeHandler(clients, usersOf(clients), testLogger())
+
+	_, _, err := handler(context.Background(), nil, GetConsumedItemsRangeInput{User: "nobody"})
 	assert.Error(t, err)
 	assert.ErrorContains(t, err, "nobody")
 }

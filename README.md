@@ -15,8 +15,8 @@ for the full architecture and conventions.
 Miranda <--Streamable HTTP (bearer token)--> httpserver
                                                   |
                                              mcpserver
-                          search_products  get_product  get_consumed_items
-                              add_consumed_item  remove_consumed_item
+                    search_products  get_product  add_consumed_item
+                       remove_consumed_item  get_consumed_items_range
                                                   |
                                           internal/yazio.Client
                                                   |
@@ -35,12 +35,14 @@ diary to read or write.
   type it supports (e.g. "piece", "portion", "glass") and its weight in
   grams. This is how a household quantity like "2 cutlets" gets converted
   to grams before logging.
-- **get_consumed_items** — the diary entries logged for a given date
-  (defaults to today).
 - **add_consumed_item** — log one food item against a meal
   (breakfast/lunch/dinner/snack) and date.
 - **remove_consumed_item** — delete a diary entry by ID, to correct a
   mistake.
+- **get_consumed_items_range** — every diary entry logged over a date range
+  (e.g. "this week"), each already resolved to its name and macros, plus
+  per-day and grand totals — the one-call answer to "what did I eat
+  today/yesterday/this week/last week".
 
 ## Building
 

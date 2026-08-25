@@ -3,19 +3,24 @@
 //
 // Tools are grouped into three flows:
 //
-//   - Product diary flow (5 tools): search_products → get_product →
-//     add_consumed_item; get_consumed_items reads back; remove_consumed_item
-//     corrects a mistake.
+//   - Product diary flow (4 tools): search_products → get_product →
+//     add_consumed_item logs a meal; remove_consumed_item corrects a
+//     mistake. Reading the diary back is handled by get_consumed_items_range
+//     (see Summary below), not a flow-specific tool — see that tool's own
+//     doc comment for why a standalone raw-ID read tool was removed.
 //
 //   - Recipe flow (6 tools): create_recipe builds a saved multi-ingredient
 //     dish; list_recipes / get_recipe browse what exists; add_consumed_recipe
 //     logs portions of a recipe to the diary; remove_consumed_recipe corrects
 //     a mistake; delete_recipe removes the recipe itself.
 //
-//   - Summary (1 tool): get_daily_summary fetches the full diary and daily
-//     goals in one call and returns consumed / goals / remaining macros
-//     computed server-side, avoiding the slow LLM tool-loop that would
-//     otherwise be needed for 20-30 diary entries.
+//   - Summary (2 tools): get_daily_summary fetches the full diary and daily
+//     goals for one date and returns consumed / goals / remaining macros
+//     computed server-side; get_consumed_items_range does the same kind of
+//     server-side resolution across a multi-day date range, keeping each
+//     entry's own resolved name and macros plus per-day and grand totals.
+//     Both avoid the slow LLM tool-loop that would otherwise be needed to
+//     read back 20-30+ diary entries one product/recipe fetch at a time.
 //
 // This service is not single-tenant: it holds a live YazioClient for each
 // configured household member, and every tool takes a required "user"
@@ -112,13 +117,6 @@ func New(clients map[string]YazioClient, logger *slog.Logger) *mcp.Server {
 	}, getProductHandler(clients, users, logger))
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "get_consumed_items",
-		Description: "Get the food diary entries logged for a given date (defaults to today if date is omitted). " +
-			"Each entry's \"id\" field is what remove_consumed_item expects — it is not the same as product_id." +
-			userHint,
-	}, getConsumedItemsHandler(clients, users, logger))
-
-	mcp.AddTool(server, &mcp.Tool{
 		Name: "add_consumed_item",
 		Description: "Log one food item to the diary for a given meal and date (date defaults to today). " +
 			"amount_grams must already be a gram (or milliliter, for liquids) figure — if the user described the " +
@@ -130,7 +128,7 @@ func New(clients map[string]YazioClient, logger *slog.Logger) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "remove_consumed_item",
-		Description: "Delete one product diary entry by its item ID, as returned by get_consumed_items's items list. " +
+		Description: "Delete one product diary entry by its item ID, as returned by get_consumed_items_range's items list. " +
 			"Use this to correct a mistaken add_consumed_item call. " +
 			"For recipe portions use remove_consumed_recipe instead." +
 			userHint,
@@ -180,7 +178,7 @@ func New(clients map[string]YazioClient, logger *slog.Logger) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "remove_consumed_recipe",
-		Description: "Delete one recipe-portion diary entry by its entry_id, as returned by get_consumed_items's recipe_portions list. " +
+		Description: "Delete one recipe-portion diary entry by its entry_id, as returned by get_consumed_items_range's recipe_portions list. " +
 			"Use this to correct a mistaken add_consumed_recipe call." +
 			userHint,
 	}, removeConsumedRecipeHandler(clients, users, logger))
@@ -191,11 +189,27 @@ func New(clients map[string]YazioClient, logger *slog.Logger) *mcp.Server {
 		Name: "get_daily_summary",
 		Description: "Returns calories and macros (protein, fat, carb) consumed today (or a given date), " +
 			"the user's configured daily goals, and what remains — all computed server-side in a single call. " +
-			"Use this instead of looping through get_consumed_items + get_product for every entry: " +
-			"the server fetches the full diary and product/recipe nutrition itself, which is much faster than " +
-			"an LLM tool loop over 20–30 diary entries." +
+			"Use this instead of get_consumed_items_range plus manually summing every entry's macros yourself: " +
+			"the server fetches the full diary, goals, and product/recipe nutrition and does the arithmetic, " +
+			"which is much faster than doing it in an LLM tool loop over 20–30 diary entries." +
 			userHint,
 	}, getDailySummaryHandler(clients, users, logger))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "get_consumed_items_range",
+		Description: "Get every diary entry (products and recipe portions) logged over a date range, " +
+			"each already resolved to its name and absolute macros (energy_kcal/protein_g/fat_g/carb_g), " +
+			"plus a total for each day and a grand total for the whole range. " +
+			"This is the tool to use for \"what did I eat today/yesterday/this week/last week\", " +
+			"or to find the item ID/entry ID of something to correct with remove_consumed_item/remove_consumed_recipe. " +
+			"Doing this manually — one lookup per product/recipe per day — is slow and token-expensive over " +
+			"several days; this call resolves everything server-side in one round trip. " +
+			"start_date and end_date are both optional, YYYY-MM-DD: if both are omitted they default to today; " +
+			"if only start_date is given, end_date defaults to it too (a single day). " +
+			"The range is inclusive on both ends and capped at 31 days. " +
+			"Every day in range is included even if nothing was logged that day, so gaps are visible." +
+			userHint,
+	}, getConsumedItemsRangeHandler(clients, users, logger))
 
 	return server
 }
@@ -300,6 +314,80 @@ func parseDateOrToday(raw string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("date must be in YYYY-MM-DD format, got %q", raw)
 	}
 	return d, nil
+}
+
+// maxConsumedItemsRangeDays caps get_consumed_items_range's span (inclusive)
+// so one call can't fan out into an unbounded number of per-day
+// GetConsumedItems calls (each of which may itself trigger several
+// per-product/per-recipe fetches) — YAZIO has no batch/range diary
+// endpoint, so every day in the range costs a separate round trip.
+const maxConsumedItemsRangeDays = 31
+
+// truncateToDate drops the time-of-day component, keeping only the
+// calendar date in t's own location — needed so the day-loop
+// (AddDate(0, 0, 1)) and the range-length check below aren't thrown off
+// by a non-midnight time-of-day inherited from parseDateOrToday's
+// time.Now() default.
+func truncateToDate(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+}
+
+// parseDateRange parses the optional start_date/end_date pair for
+// get_consumed_items_range:
+//   - both omitted: both default to today (a single-day range)
+//   - only start_date given: end_date defaults to start_date (also a
+//     single day)
+//   - only end_date given: rejected — there's no sensible start_date to
+//     infer, and silently picking one (e.g. 7 days back) would be a
+//     surprising default for a caller who explicitly named an end
+//   - end_date before start_date: rejected
+//   - range spanning more than maxConsumedItemsRangeDays days inclusive:
+//     rejected
+func parseDateRange(rawStart, rawEnd string) (start, end time.Time, err error) {
+	rawStart = strings.TrimSpace(rawStart)
+	rawEnd = strings.TrimSpace(rawEnd)
+
+	if rawStart == "" && rawEnd != "" {
+		return time.Time{}, time.Time{}, fmt.Errorf(
+			"end_date %q given without start_date — provide start_date too, or omit end_date to default it to start_date", rawEnd)
+	}
+
+	start, err = parseDateOrToday(rawStart)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	start = truncateToDate(start)
+
+	if rawEnd == "" {
+		end = start
+	} else {
+		end, err = time.Parse(dateLayout, rawEnd)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("end_date must be in YYYY-MM-DD format, got %q", rawEnd)
+		}
+		end = truncateToDate(end)
+	}
+
+	if end.Before(start) {
+		return time.Time{}, time.Time{}, fmt.Errorf(
+			"end_date %s is before start_date %s", end.Format(dateLayout), start.Format(dateLayout))
+	}
+
+	// Count days by walking rather than dividing Sub() by 24h, so DST
+	// transitions in the server's local zone can't throw the count off by
+	// one — this also doubles as a cheap, iteration-bounded cap check.
+	days := 0
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		days++
+		if days > maxConsumedItemsRangeDays {
+			return time.Time{}, time.Time{}, fmt.Errorf(
+				"date range too large: %s to %s spans more than %d days — narrow the range",
+				start.Format(dateLayout), end.Format(dateLayout), maxConsumedItemsRangeDays)
+		}
+	}
+
+	return start, end, nil
 }
 
 // friendlyYazioError adds a short, actionable prefix for the sentinel
@@ -435,106 +523,6 @@ func formatProductDetail(p ProductInfo) string {
 	return b.String()
 }
 
-// --- get_consumed_items ---
-
-type GetConsumedItemsInput struct {
-	User string `json:"user" jsonschema:"Which configured YAZIO account's diary to read."`
-	Date string `json:"date,omitempty" jsonschema:"Date to fetch entries for, YYYY-MM-DD. Defaults to today if omitted."`
-}
-
-type ConsumedItemInfo struct {
-	ID              string  `json:"id"`
-	ProductID       string  `json:"product_id"`
-	Daytime         string  `json:"daytime"`
-	AmountGrams     float64 `json:"amount_grams"`
-	Serving         string  `json:"serving,omitempty"`
-	ServingQuantity float64 `json:"serving_quantity,omitempty"`
-}
-
-// ConsumedRecipePortionInfo is the MCP-facing shape of a logged recipe
-// portion returned by get_consumed_items. Use its entry_id (not recipe_id)
-// with remove_consumed_recipe to delete it.
-type ConsumedRecipePortionInfo struct {
-	EntryID      string  `json:"entry_id"`
-	RecipeID     string  `json:"recipe_id"`
-	Daytime      string  `json:"daytime"`
-	PortionCount float64 `json:"portion_count"`
-}
-
-type GetConsumedItemsOutput struct {
-	Date           string                      `json:"date"`
-	Items          []ConsumedItemInfo          `json:"items"`
-	RecipePortions []ConsumedRecipePortionInfo `json:"recipe_portions"`
-	Total          int                         `json:"total"`
-}
-
-func getConsumedItemsHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[GetConsumedItemsInput, GetConsumedItemsOutput] {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in GetConsumedItemsInput) (*mcp.CallToolResult, GetConsumedItemsOutput, error) {
-		client, err := resolveClient(clients, users, "get_consumed_items", in.User)
-		if err != nil {
-			return nil, GetConsumedItemsOutput{}, err
-		}
-
-		date, err := parseDateOrToday(in.Date)
-		if err != nil {
-			return nil, GetConsumedItemsOutput{}, fmt.Errorf("get_consumed_items: %w", err)
-		}
-
-		products, portions, err := client.GetConsumedItems(ctx, date)
-		if err != nil {
-			return nil, GetConsumedItemsOutput{}, friendlyYazioError("get_consumed_items", in.User, err)
-		}
-
-		infos := make([]ConsumedItemInfo, len(products))
-		for i, it := range products {
-			infos[i] = ConsumedItemInfo{
-				ID:              it.ID,
-				ProductID:       it.ProductID,
-				Daytime:         it.Daytime,
-				AmountGrams:     it.Amount,
-				Serving:         it.Serving,
-				ServingQuantity: it.ServingQuantity,
-			}
-		}
-
-		portionInfos := make([]ConsumedRecipePortionInfo, len(portions))
-		for i, p := range portions {
-			portionInfos[i] = ConsumedRecipePortionInfo{
-				EntryID:      p.ID,
-				RecipeID:     p.RecipeID,
-				Daytime:      p.Daytime,
-				PortionCount: p.PortionCount,
-			}
-		}
-
-		dateStr := date.Format(dateLayout)
-		total := len(infos) + len(portionInfos)
-		logger.Info("get_consumed_items", "user", in.User, "date", dateStr, "products", len(infos), "recipe_portions", len(portionInfos))
-
-		out := GetConsumedItemsOutput{Date: dateStr, Items: infos, RecipePortions: portionInfos, Total: total}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: formatConsumedItems(dateStr, infos, portionInfos)}}}, out, nil
-	}
-}
-
-func formatConsumedItems(date string, items []ConsumedItemInfo, portions []ConsumedRecipePortionInfo) string {
-	if len(items) == 0 && len(portions) == 0 {
-		return fmt.Sprintf("No diary entries for %s.", date)
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "%d entr(y/ies) for %s:\n", len(items)+len(portions), date)
-	for _, it := range items {
-		fmt.Fprintf(&b, "\n- id: %s\n  product_id: %s\n  meal: %s\n  amount: %gg", it.ID, it.ProductID, it.Daytime, it.AmountGrams)
-		if it.Serving != "" {
-			fmt.Fprintf(&b, " (%g x %q)", it.ServingQuantity, it.Serving)
-		}
-		b.WriteString("\n")
-	}
-	for _, p := range portions {
-		fmt.Fprintf(&b, "\n- entry_id: %s  [recipe]\n  recipe_id: %s\n  meal: %s\n  portions: %g\n", p.EntryID, p.RecipeID, p.Daytime, p.PortionCount)
-	}
-	return b.String()
-}
-
 // --- add_consumed_item ---
 
 type AddConsumedItemInput struct {
@@ -592,7 +580,7 @@ func addConsumedItemHandler(clients map[string]YazioClient, users []string, logg
 
 type RemoveConsumedItemInput struct {
 	User   string `json:"user" jsonschema:"Which configured YAZIO account's diary to delete the entry from."`
-	ItemID string `json:"item_id" jsonschema:"The diary entry ID to delete, as returned by get_consumed_items's \"id\" field (not product_id)."`
+	ItemID string `json:"item_id" jsonschema:"The diary entry ID to delete, as returned by get_consumed_items_range's \"id\" field (not product_id)."`
 }
 
 type RemoveConsumedItemOutput struct {
@@ -983,7 +971,7 @@ func addConsumedRecipeHandler(clients map[string]YazioClient, users []string, lo
 
 type RemoveConsumedRecipeInput struct {
 	User    string `json:"user" jsonschema:"Which configured YAZIO account's diary to delete the entry from."`
-	EntryID string `json:"entry_id" jsonschema:"The recipe-portion diary entry ID to delete, as returned by get_consumed_items's recipe_portions list (entry_id field, not recipe_id)."`
+	EntryID string `json:"entry_id" jsonschema:"The recipe-portion diary entry ID to delete, as returned by get_consumed_items_range's recipe_portions list (entry_id field, not recipe_id)."`
 }
 
 type RemoveConsumedRecipeOutput struct {
@@ -1141,5 +1129,244 @@ func formatDailySummary(out GetDailySummaryOutput) string {
 		out.Goals.EnergyKcal, out.Goals.ProteinG, out.Goals.FatG, out.Goals.CarbG)
 	fmt.Fprintf(&b, "Remaining: %.0f kcal | protein %.1fg | fat %.1fg | carbs %.1fg\n",
 		out.Remaining.EnergyKcal, out.Remaining.ProteinG, out.Remaining.FatG, out.Remaining.CarbG)
+	return b.String()
+}
+
+// --- get_consumed_items_range ---
+
+// RangeConsumedItemInfo is one product diary entry within
+// get_consumed_items_range. It carries its own resolved name/producer and
+// absolute macros for this specific logged amount (not just a raw
+// product_id), so the caller never needs a follow-up get_product call —
+// this is the whole reason get_consumed_items_range exists rather than a
+// raw-ID-only diary reader (see the package doc comment's Product diary
+// flow note for why a separate get_consumed_items was removed).
+type RangeConsumedItemInfo struct {
+	ID          string  `json:"id"`
+	ProductID   string  `json:"product_id"`
+	Name        string  `json:"name"`
+	Producer    string  `json:"producer,omitempty"`
+	Daytime     string  `json:"daytime"`
+	AmountGrams float64 `json:"amount_grams"`
+	EnergyKcal  float64 `json:"energy_kcal"`
+	ProteinG    float64 `json:"protein_g"`
+	FatG        float64 `json:"fat_g"`
+	CarbG       float64 `json:"carb_g"`
+}
+
+// RangeRecipePortionInfo is one recipe-portion diary entry within
+// get_consumed_items_range, resolved the same way: name plus absolute
+// macros for the logged portion fraction (recipe total * portions /
+// recipe.PortionCount), not just the raw portion_count.
+type RangeRecipePortionInfo struct {
+	EntryID      string  `json:"entry_id"`
+	RecipeID     string  `json:"recipe_id"`
+	Name         string  `json:"name"`
+	Daytime      string  `json:"daytime"`
+	PortionCount float64 `json:"portion_count"`
+	EnergyKcal   float64 `json:"energy_kcal"`
+	ProteinG     float64 `json:"protein_g"`
+	FatG         float64 `json:"fat_g"`
+	CarbG        float64 `json:"carb_g"`
+}
+
+// DayEntries is one calendar day's diary within a get_consumed_items_range
+// response. One entry is returned per day in [start_date, end_date]
+// inclusive, even for days with nothing logged (empty Items/RecipePortions,
+// zero Totals), so a weekly view can show gaps rather than silently
+// omitting them.
+type DayEntries struct {
+	Date           string                   `json:"date"`
+	Items          []RangeConsumedItemInfo  `json:"items"`
+	RecipePortions []RangeRecipePortionInfo `json:"recipe_portions"`
+	Totals         NutrientTotals           `json:"totals"`
+}
+
+type GetConsumedItemsRangeInput struct {
+	User      string `json:"user" jsonschema:"Which configured YAZIO account's diary to read."`
+	StartDate string `json:"start_date,omitempty" jsonschema:"First date of the range, YYYY-MM-DD, inclusive. If both start_date and end_date are omitted, defaults to today (a single-day range). If given without end_date, end_date defaults to start_date (also a single day)."`
+	EndDate   string `json:"end_date,omitempty" jsonschema:"Last date of the range, YYYY-MM-DD, inclusive. Defaults to start_date if omitted. Must not be given without start_date. The range is capped at 31 days total."`
+}
+
+type GetConsumedItemsRangeOutput struct {
+	StartDate string         `json:"start_date"`
+	EndDate   string         `json:"end_date"`
+	Days      []DayEntries   `json:"days"`
+	Total     NutrientTotals `json:"total"`
+}
+
+func getConsumedItemsRangeHandler(clients map[string]YazioClient, users []string, logger *slog.Logger) mcp.ToolHandlerFor[GetConsumedItemsRangeInput, GetConsumedItemsRangeOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in GetConsumedItemsRangeInput) (*mcp.CallToolResult, GetConsumedItemsRangeOutput, error) {
+		client, err := resolveClient(clients, users, "get_consumed_items_range", in.User)
+		if err != nil {
+			return nil, GetConsumedItemsRangeOutput{}, err
+		}
+
+		start, end, err := parseDateRange(in.StartDate, in.EndDate)
+		if err != nil {
+			return nil, GetConsumedItemsRangeOutput{}, fmt.Errorf("get_consumed_items_range: %w", err)
+		}
+
+		// Caches scoped across the WHOLE range (built once, outside the day
+		// loop) — the same product/recipe (e.g. a repeated breakfast) often
+		// appears across several days of a week, and re-fetching it once
+		// per day would defeat half the point of this tool. This
+		// generalizes get_daily_summary's per-call productCache/recipeCache
+		// from single-day to whole-range scope.
+		productCache := make(map[string]*yazio.Product)
+		recipeCache := make(map[string]*yazio.Recipe)
+
+		var days []DayEntries
+		grandTotal := yazio.Nutrients{}
+
+		for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+			dateStr := d.Format(dateLayout)
+
+			productEntries, recipePortions, err := client.GetConsumedItems(ctx, d)
+			if err != nil {
+				return nil, GetConsumedItemsRangeOutput{}, friendlyYazioError(
+					fmt.Sprintf("get_consumed_items_range: fetching diary for %s", dateStr), in.User, err)
+			}
+
+			dayTotal := yazio.Nutrients{}
+			items := make([]RangeConsumedItemInfo, 0, len(productEntries))
+			for _, item := range productEntries {
+				p, ok := productCache[item.ProductID]
+				if !ok {
+					p, err = client.GetProduct(ctx, item.ProductID)
+					if err != nil {
+						return nil, GetConsumedItemsRangeOutput{}, friendlyYazioError(
+							fmt.Sprintf("get_consumed_items_range: fetching product %s", item.ProductID), in.User, err)
+					}
+					productCache[item.ProductID] = p
+				}
+
+				// Per-item absolute macros: per-gram * amount, accumulated
+				// into both this day's total and the grand total in the
+				// same pass (mirrors get_daily_summary's accumulation loop,
+				// but keeps the per-item figure too).
+				itemNutrients := yazio.Nutrients{}
+				for k, perGram := range p.Nutrients {
+					v := perGram * item.Amount
+					itemNutrients[k] += v
+					dayTotal[k] += v
+					grandTotal[k] += v
+				}
+				items = append(items, RangeConsumedItemInfo{
+					ID:          item.ID,
+					ProductID:   item.ProductID,
+					Name:        p.Name,
+					Producer:    p.Producer,
+					Daytime:     item.Daytime,
+					AmountGrams: item.Amount,
+					EnergyKcal:  itemNutrients.EnergyKcalPerGram(),
+					ProteinG:    itemNutrients.ProteinPerGram(),
+					FatG:        itemNutrients.FatPerGram(),
+					CarbG:       itemNutrients.CarbPerGram(),
+				})
+			}
+
+			portionsOut := make([]RangeRecipePortionInfo, 0, len(recipePortions))
+			for _, portion := range recipePortions {
+				r, ok := recipeCache[portion.RecipeID]
+				if !ok {
+					r, err = client.GetRecipe(ctx, portion.RecipeID)
+					if err != nil {
+						return nil, GetConsumedItemsRangeOutput{}, friendlyYazioError(
+							fmt.Sprintf("get_consumed_items_range: fetching recipe %s", portion.RecipeID), in.User, err)
+					}
+					recipeCache[portion.RecipeID] = r
+				}
+				// Recipe.Nutrients holds whole-recipe totals; scale by the
+				// logged fraction of portions (portionCount / recipe.PortionCount) —
+				// same convention as get_daily_summary.
+				divisor := r.PortionCount
+				if divisor <= 0 {
+					divisor = 1
+				}
+				fraction := portion.PortionCount / divisor
+
+				portionNutrients := yazio.Nutrients{}
+				for k, total := range r.Nutrients {
+					v := total * fraction
+					portionNutrients[k] += v
+					dayTotal[k] += v
+					grandTotal[k] += v
+				}
+				portionsOut = append(portionsOut, RangeRecipePortionInfo{
+					EntryID:      portion.ID,
+					RecipeID:     portion.RecipeID,
+					Name:         r.Name,
+					Daytime:      portion.Daytime,
+					PortionCount: portion.PortionCount,
+					EnergyKcal:   portionNutrients.EnergyKcalPerGram(),
+					ProteinG:     portionNutrients.ProteinPerGram(),
+					FatG:         portionNutrients.FatPerGram(),
+					CarbG:        portionNutrients.CarbPerGram(),
+				})
+			}
+
+			days = append(days, DayEntries{
+				Date:           dateStr,
+				Items:          items,
+				RecipePortions: portionsOut,
+				Totals: NutrientTotals{
+					EnergyKcal: dayTotal.EnergyKcalPerGram(),
+					ProteinG:   dayTotal.ProteinPerGram(),
+					FatG:       dayTotal.FatPerGram(),
+					CarbG:      dayTotal.CarbPerGram(),
+				},
+			})
+		}
+
+		out := GetConsumedItemsRangeOutput{
+			StartDate: start.Format(dateLayout),
+			EndDate:   end.Format(dateLayout),
+			Days:      days,
+			Total: NutrientTotals{
+				EnergyKcal: grandTotal.EnergyKcalPerGram(),
+				ProteinG:   grandTotal.ProteinPerGram(),
+				FatG:       grandTotal.FatPerGram(),
+				CarbG:      grandTotal.CarbPerGram(),
+			},
+		}
+
+		logger.Info("get_consumed_items_range", "user", in.User, "start_date", out.StartDate, "end_date", out.EndDate,
+			"days", len(days), "products_fetched", len(productCache), "recipes_fetched", len(recipeCache),
+			"total_kcal", out.Total.EnergyKcal)
+
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: formatConsumedItemsRange(out)}}}, out, nil
+	}
+}
+
+func formatConsumedItemsRange(out GetConsumedItemsRangeOutput) string {
+	var b strings.Builder
+	if out.StartDate == out.EndDate {
+		fmt.Fprintf(&b, "Diary for %s\n\n", out.StartDate)
+	} else {
+		fmt.Fprintf(&b, "Diary from %s to %s\n\n", out.StartDate, out.EndDate)
+	}
+	for _, day := range out.Days {
+		fmt.Fprintf(&b, "--- %s ---\n", day.Date)
+		if len(day.Items) == 0 && len(day.RecipePortions) == 0 {
+			b.WriteString("  (no entries)\n")
+		}
+		for _, it := range day.Items {
+			fmt.Fprintf(&b, "  - %s", it.Name)
+			if it.Producer != "" {
+				fmt.Fprintf(&b, " (%s)", it.Producer)
+			}
+			fmt.Fprintf(&b, ": %gg, %s — %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb  [id: %s]\n",
+				it.AmountGrams, it.Daytime, it.EnergyKcal, it.ProteinG, it.FatG, it.CarbG, it.ID)
+		}
+		for _, p := range day.RecipePortions {
+			fmt.Fprintf(&b, "  - %s [recipe]: %g portion(s), %s — %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb  [entry_id: %s]\n",
+				p.Name, p.PortionCount, p.Daytime, p.EnergyKcal, p.ProteinG, p.FatG, p.CarbG, p.EntryID)
+		}
+		fmt.Fprintf(&b, "  day total: %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb\n\n",
+			day.Totals.EnergyKcal, day.Totals.ProteinG, day.Totals.FatG, day.Totals.CarbG)
+	}
+	fmt.Fprintf(&b, "Range total: %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb\n",
+		out.Total.EnergyKcal, out.Total.ProteinG, out.Total.FatG, out.Total.CarbG)
 	return b.String()
 }

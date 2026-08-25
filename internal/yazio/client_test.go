@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -285,6 +286,64 @@ func TestClient_GetProduct_FillsIDFromRequestAndParsesServings(t *testing.T) {
 	assert.Equal(t, "cutlet-id", p.ID)
 	require.Len(t, p.Servings, 2)
 	assert.Equal(t, Serving{Type: "piece", Amount: 70}, p.Servings[0])
+}
+
+func TestClient_GetProduct_CachesByID(t *testing.T) {
+	var callCount atomic.Int32
+	api := &fakeAPI{
+		oauthHandler: tokenReply("access-1", "refresh-1"),
+		apiHandler: func(w http.ResponseWriter, r *http.Request) {
+			callCount.Add(1)
+			_, _ = w.Write([]byte(`{"name":"Cutlet","base_unit":"g","nutrients":{"energy.energy":2.5}}`))
+		},
+	}
+	client := newTestClient(t, api)
+
+	p1, err := client.GetProduct(t.Context(), "cutlet-id")
+	require.NoError(t, err)
+	p2, err := client.GetProduct(t.Context(), "cutlet-id")
+	require.NoError(t, err)
+
+	assert.Equal(t, int32(1), callCount.Load(), "second GetProduct call for the same id must be served from cache")
+	assert.Same(t, p1, p2, "cached calls return the same *Product")
+}
+
+func TestClient_GetProduct_CacheIsPerID(t *testing.T) {
+	api := &fakeAPI{
+		oauthHandler: tokenReply("access-1", "refresh-1"),
+		apiHandler: func(w http.ResponseWriter, r *http.Request) {
+			id := strings.TrimPrefix(r.URL.Path, "/products/")
+			_, _ = w.Write([]byte(`{"name":"` + id + `","base_unit":"g","nutrients":{"energy.energy":1.0}}`))
+		},
+	}
+	client := newTestClient(t, api)
+
+	p1, err := client.GetProduct(t.Context(), "id-1")
+	require.NoError(t, err)
+	p2, err := client.GetProduct(t.Context(), "id-2")
+	require.NoError(t, err)
+
+	assert.Equal(t, "id-1", p1.Name)
+	assert.Equal(t, "id-2", p2.Name)
+}
+
+func TestClient_GetProduct_DoesNotCacheErrors(t *testing.T) {
+	var callCount atomic.Int32
+	api := &fakeAPI{
+		oauthHandler: tokenReply("access-1", "refresh-1"),
+		apiHandler: func(w http.ResponseWriter, r *http.Request) {
+			callCount.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		},
+	}
+	client := newTestClient(t, api)
+
+	_, err1 := client.GetProduct(t.Context(), "missing-id")
+	_, err2 := client.GetProduct(t.Context(), "missing-id")
+
+	assert.ErrorIs(t, err1, ErrNotFound)
+	assert.ErrorIs(t, err2, ErrNotFound)
+	assert.Equal(t, int32(2), callCount.Load(), "a failed lookup must not be cached — the second call should hit the API again")
 }
 
 func failIfCalled(t *testing.T) http.HandlerFunc {

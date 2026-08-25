@@ -31,8 +31,8 @@ host-native under `systemd --user`.
 Miranda <--Streamable HTTP (bearer token)--> httpserver
                                                   |
                                              mcpserver
-                          search_products  get_product  get_consumed_items
-                              add_consumed_item  remove_consumed_item
+                    search_products  get_product  add_consumed_item
+                       remove_consumed_item  get_consumed_items_range
                                (every tool takes a required "user" param)
                                                   |
                                   map[string]internal/yazio.Client
@@ -107,6 +107,25 @@ concept of "user"; that's purely a `main.go`/`mcpserver` wiring concern
    token and the account password are never logged**, only
    lengths/presence or the surrounding error context.
 
+### Product cache
+
+`internal/yazio.Client.GetProduct` caches every product it fetches, in
+memory, by `product_id` (`internal/yazio/products.go`'s `productCache`,
+guarded by a mutex) — a diary walk across many days (`get_daily_summary`,
+`get_consumed_items_range`) or a multi-ingredient `create_recipe` call
+would otherwise refetch the same handful of everyday foods (a repeated
+breakfast, a household staple) over and over. It's deliberately simple:
+unbounded (no LRU/size cap — a household's set of distinct logged foods
+stays small, tens to low hundreds over a service's lifetime) and never
+invalidated (YAZIO's per-product nutrition facts are static reference
+data), so there's no expiry logic to get wrong. It's in-memory only and
+doesn't survive a restart, unlike the token cache above — that's fine,
+since this is purely a repeat-request optimization, not something
+correctness depends on. It's scoped per `Client` (i.e. per configured
+user) rather than shared globally, matching how every other piece of
+per-account state in this package works — see "What's deliberately not
+here" for the cases this doesn't cover.
+
 ### Request flow for `add_consumed_item` (the non-obvious tool)
 
 This is the tool behind the target scenario: "log 400g of chicken soup,
@@ -139,9 +158,16 @@ sizes, not the end user.
    should only ever pass IDs that came from `search_products` or
    `get_product` in the same conversation.
 
-`get_consumed_items` / `remove_consumed_item` are the read/undo halves of
-the same flow — `remove_consumed_item` takes the diary-entry `id` from
-`get_consumed_items`, not a `product_id`.
+`get_consumed_items_range` / `remove_consumed_item` are the read/undo
+halves of the same flow — `remove_consumed_item` takes the diary-entry
+`id` from `get_consumed_items_range`, not a `product_id`. There is no
+standalone raw-ID-only diary reader: an earlier `get_consumed_items` was
+removed once `get_consumed_items_range` shipped, since its output is a
+strict superset (same `id`/`product_id` fields, plus resolved name and
+macros) and every real caller needs the name to match against what the
+user actually said — a raw-ID tool has no use case `get_consumed_items_range`
+doesn't already cover, so keeping both would just leave Miranda to guess
+which one to call.
 
 ### Search locale
 
@@ -208,7 +234,12 @@ login for each user — no manual setup needed there.
   exposes these too, but the target use case is only the food diary. Add
   a tool + `internal/yazio` method the same way `add_consumed_item` is
   built if one of these becomes needed.
-- **A local product cache/database** — every `search_products`/
-  `get_product` call hits YAZIO directly. Worth revisiting only if rate
-  limiting (`ErrRateLimited`) becomes a real problem for actual usage
-  patterns.
+- **A cache for `search_products`** — only `GetProduct` results are cached
+  (see the Product cache section above); search is a free-text query, not
+  a stable key, and hasn't shown the same repeat-lookup pattern that
+  `GetProduct` does across a diary walk.
+- **Cross-account or persistent product caching** — the cache is in-memory
+  and per-`Client` (per configured user), not shared globally or written
+  to disk. Revisit only if profiling shows the per-account duplication
+  (two household members logging the same common food) actually matters
+  at this service's scale.

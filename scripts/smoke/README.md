@@ -37,11 +37,10 @@ make run                # or: ./miranda-yazio
 
 - **`run-all.sh`** — the full sequence used to verify this service:
   `/healthz` → `tools/list` → `search_products` → `get_product` →
-  `get_consumed_items` → `add_consumed_item` → `get_consumed_items`
-  (confirms it landed) → `remove_consumed_item` → `get_consumed_items`
-  (confirms cleanup). **This performs one real write-then-delete against
-  the configured YAZIO account's diary** — it cleans up after itself, but
-  it is not a dry run.
+  `add_consumed_item` → `get_consumed_items_range` (confirms it landed) →
+  `remove_consumed_item` → `get_consumed_items_range` (confirms cleanup).
+  **This performs one real write-then-delete against the configured YAZIO
+  account's diary** — it cleans up after itself, but it is not a dry run.
 
   ```bash
   ./scripts/smoke/run-all.sh

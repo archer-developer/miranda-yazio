@@ -43,6 +43,7 @@ type Client struct {
 	locales    string // pre-joined comma-separated locale priority list
 	sex        string
 	logger     *slog.Logger
+	products   *productCache
 }
 
 // Options configures New. Username and Password are required; every other
@@ -139,6 +140,7 @@ func New(opts Options) (*Client, error) {
 		locales:    strings.Join(locales, ","),
 		sex:        sex,
 		logger:     logger,
+		products:   newProductCache(),
 	}, nil
 }
 
