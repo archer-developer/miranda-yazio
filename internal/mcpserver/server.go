@@ -122,13 +122,16 @@ func New(clients map[string]YazioClient, logger *slog.Logger) *mcp.Server {
 			"amount_grams must already be a gram (or milliliter, for liquids) figure — if the user described the " +
 			"amount in household units (\"2 cutlets\", \"a cup\", \"400 g\"), first call search_products and " +
 			"get_product to find the matching serving size and compute amount_grams yourself; do not guess. " +
-			"Call this once per distinct food item — e.g. a meal of soup, mashed potatoes, and cutlets is three calls." +
+			"Call this once per distinct food item — e.g. a meal of soup, mashed potatoes, and cutlets is three calls. " +
+			"product_id must be a product ID (from search_products, or the product_id of an existing diary entry in " +
+			"get_consumed_items_range when copying a meal) — never a diary entry's item_id." +
 			userHint,
 	}, addConsumedItemHandler(clients, users, logger))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "remove_consumed_item",
-		Description: "Delete one product diary entry by its item ID, as returned by get_consumed_items_range's items list. " +
+		Description: "Delete one product diary entry by its item_id, as returned by get_consumed_items_range's items list " +
+			"(not its product_id). The item_id must come from this same user's diary. " +
 			"Use this to correct a mistaken add_consumed_item call. " +
 			"For recipe portions use remove_consumed_recipe instead." +
 			userHint,
@@ -202,6 +205,11 @@ func New(clients map[string]YazioClient, logger *slog.Logger) *mcp.Server {
 			"plus a total for each day and a grand total for the whole range. " +
 			"This is the tool to use for \"what did I eat today/yesterday/this week/last week\", " +
 			"or to find the item ID/entry ID of something to correct with remove_consumed_item/remove_consumed_recipe. " +
+			"Each product entry carries two IDs: item_id identifies the diary entry itself (pass it to remove_consumed_item), " +
+			"product_id identifies the food (pass it to add_consumed_item, e.g. to copy a meal to another day or another " +
+			"user's diary). Never pass an item_id as a product_id — YAZIO accepts it but silently logs nothing. " +
+			"Recipe portions likewise carry entry_id (for remove_consumed_recipe) and recipe_id (for add_consumed_recipe; " +
+			"recipes belong to one account, so a recipe_id only works for the user whose diary it came from). " +
 			"Doing this manually — one lookup per product/recipe per day — is slow and token-expensive over " +
 			"several days; this call resolves everything server-side in one round trip. " +
 			"start_date and end_date are both optional, YYYY-MM-DD: if both are omitted they default to today; " +
@@ -580,7 +588,7 @@ func addConsumedItemHandler(clients map[string]YazioClient, users []string, logg
 
 type RemoveConsumedItemInput struct {
 	User   string `json:"user" jsonschema:"Which configured YAZIO account's diary to delete the entry from."`
-	ItemID string `json:"item_id" jsonschema:"The diary entry ID to delete, as returned by get_consumed_items_range's \"id\" field (not product_id)."`
+	ItemID string `json:"item_id" jsonschema:"The diary entry ID to delete, as returned by get_consumed_items_range's item_id (not product_id)."`
 }
 
 type RemoveConsumedItemOutput struct {
@@ -1356,12 +1364,12 @@ func formatConsumedItemsRange(out GetConsumedItemsRangeOutput) string {
 			if it.Producer != "" {
 				fmt.Fprintf(&b, " (%s)", it.Producer)
 			}
-			fmt.Fprintf(&b, ": %gg, %s — %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb  [id: %s]\n",
-				it.AmountGrams, it.Daytime, it.EnergyKcal, it.ProteinG, it.FatG, it.CarbG, it.ID)
+			fmt.Fprintf(&b, ": %gg, %s — %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb  [item_id: %s, product_id: %s]\n",
+				it.AmountGrams, it.Daytime, it.EnergyKcal, it.ProteinG, it.FatG, it.CarbG, it.ID, it.ProductID)
 		}
 		for _, p := range day.RecipePortions {
-			fmt.Fprintf(&b, "  - %s [recipe]: %g portion(s), %s — %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb  [entry_id: %s]\n",
-				p.Name, p.PortionCount, p.Daytime, p.EnergyKcal, p.ProteinG, p.FatG, p.CarbG, p.EntryID)
+			fmt.Fprintf(&b, "  - %s [recipe]: %g portion(s), %s — %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb  [entry_id: %s, recipe_id: %s]\n",
+				p.Name, p.PortionCount, p.Daytime, p.EnergyKcal, p.ProteinG, p.FatG, p.CarbG, p.EntryID, p.RecipeID)
 		}
 		fmt.Fprintf(&b, "  day total: %.0f kcal, %.1fg protein, %.1fg fat, %.1fg carb\n\n",
 			day.Totals.EnergyKcal, day.Totals.ProteinG, day.Totals.FatG, day.Totals.CarbG)

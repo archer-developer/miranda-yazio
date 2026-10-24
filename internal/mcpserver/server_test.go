@@ -937,3 +937,23 @@ func TestGetConsumedItemsRangeHandler_RejectsUnknownUser(t *testing.T) {
 	assert.Error(t, err)
 	assert.ErrorContains(t, err, "nobody")
 }
+
+// TestFormatConsumedItemsRange_ShowsBothIDs guards the text the model actually
+// reads: each product entry must expose both its item_id (for
+// remove_consumed_item) and its product_id (for add_consumed_item). Before
+// product_id was printed the model copied a meal between users by passing
+// item_ids as product_ids — YAZIO accepted them and silently logged nothing.
+func TestFormatConsumedItemsRange_ShowsBothIDs(t *testing.T) {
+	text := formatConsumedItemsRange(GetConsumedItemsRangeOutput{
+		StartDate: "2026-10-19",
+		EndDate:   "2026-10-19",
+		Days: []DayEntries{{
+			Date:           "2026-10-19",
+			Items:          []RangeConsumedItemInfo{{ID: "item-1", ProductID: "prod-1", Name: "Молоко", Daytime: "lunch", AmountGrams: 110}},
+			RecipePortions: []RangeRecipePortionInfo{{EntryID: "entry-1", RecipeID: "recipe-1", Name: "Суп", Daytime: "lunch", PortionCount: 1}},
+		}},
+	})
+
+	assert.Contains(t, text, "[item_id: item-1, product_id: prod-1]")
+	assert.Contains(t, text, "[entry_id: entry-1, recipe_id: recipe-1]")
+}
